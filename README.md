@@ -1,4 +1,8 @@
-# SIGIL
+<p align="center">
+  <img src="sigil_logo.png" alt="Flipbird Sigil" width="200"/>
+</p>
+
+# Flipbird Sigil
 ## Sovereign Integrity & Governance Interface Layer
 
 **Open-source LLM prompt security. Zero dependencies on external servers.**
