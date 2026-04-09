@@ -330,6 +330,6 @@ If you find this useful, consider supporting development:
 
 ## License
 
-**[CC0 1.0 (Public Domain)](LICENSE)**
+MIT. See [LICENSE](LICENSE).
 
 Do whatever you want with this. Fork it, sell it, break it, fix it. No attribution required.
