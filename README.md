@@ -264,12 +264,25 @@ tools.execute("transfer", seal, ...)  # [FAIL] PermissionError
 
 ---
 
-## Limitations
+## Known Limitations
 
-- **LLMs don't structurally enforce XML boundaries.** The `<IRONCLAD_CONTEXT>` / `<USER_DATA>` separation is advisory — it relies on the model respecting the trust hierarchy in context. Sophisticated attacks may still succeed against some models. The signatures and boundaries are defense-in-depth, not guarantees.
+SIGIL makes deliberate trade-offs. Understand them before deploying.
+
+### Security boundaries
+
+- **LLMs don't structurally enforce XML boundaries.** The `<IRONCLAD_CONTEXT>` / `<USER_DATA>` separation is advisory — it relies on the model respecting the trust hierarchy in context. Sophisticated attacks may still succeed against some models. The signatures and boundaries are defense-in-depth, not guarantees. Treat LLM output as untrusted regardless of whether the input was sealed.
 - **Cryptographic signing proves integrity, not behavior.** SIGIL proves that instructions haven't been tampered with; it cannot force an LLM to follow them.
 - **Encoding detection is heuristic.** The input normalizer catches common patterns (Base64, ROT13, Hex) but cannot decode every possible obfuscation scheme.
+
+### Deployment shape
+
+- **Single-host design.** SIGIL relies on the local filesystem (`.sigil/`) and `fcntl`/`msvcrt` file locks for the audit chain, nonce store, and HumanGate approvals. This is correct for single-host deployments and breaks at horizontal scale. Running 50 containers against a shared network drive is not supported. A pluggable state backend (DB-backed chain, Redis for nonces/locks) is the right enterprise path — see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the design sketch.
+- **System signing key is stored unencrypted on disk** (`0o600` at `.sigil/keys/_system.key`). An attacker with RCE or LFI on the host can read it and forge audit entries. For production, the `_get_system_signer()` chokepoint is designed to be swapped for an HSM / AWS KMS / Vault adapter. Not shipped yet.
 - **File locks are best-effort on some platforms.** While SIGIL defaults to strict (fail-closed) locking, edge cases in network filesystems may still permit races.
+
+### Performance
+
+- **UncertaintyGate costs 3x tokens and 3x latency.** Self-consistency voting requires `k_samples=3` by default. Samples are currently generated sequentially. Use it for high-stakes calls only; don't wrap every LLM request in it.
 
 ---
 
