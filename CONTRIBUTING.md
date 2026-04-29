@@ -1,6 +1,6 @@
 # Contributing to SIGIL
 
-Thanks for your interest in contributing! SIGIL is a public domain project, and contributions are welcome.
+Thanks for your interest in contributing! SIGIL is MIT licensed, and contributions are welcome.
 
 ## How to Contribute
 
@@ -43,4 +43,4 @@ If you discover a security vulnerability, please **do not** open a public issue.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under CC0 1.0 (Public Domain), the same as the project.
+By contributing, you agree that your contributions will be licensed under the MIT License, the same as the project.

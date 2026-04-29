@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigil-security"
+version = "1.6.1"
+description = "Sovereign Integrity & Governance Interface Layer — open-source cryptographic prompt security for agentic LLM systems."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Nathan \"Cid\" Seals", email = "thenathanseals@gmail.com" },
+]
+keywords = [
+    "llm",
+    "prompt-injection",
+    "security",
+    "agentic-ai",
+    "ed25519",
+    "audit-chain",
+    "cryptography",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "pynacl>=1.5",
+]
+
+[project.optional-dependencies]
+llm = [
+    "httpx>=0.25",
+    "python-dotenv>=1.0",
+]
+tokens = [
+    "tiktoken>=0.7",
+]
+all = [
+    "httpx>=0.25",
+    "python-dotenv>=1.0",
+    "tiktoken>=0.7",
+]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.25",
+    "python-dotenv>=1.0",
+    "tiktoken>=0.7",
+]
+
+[project.scripts]
+sigil = "sigil:_cli_entry"
+
+[project.urls]
+Homepage = "https://github.com/mr-gl00m/sigil"
+Repository = "https://github.com/mr-gl00m/sigil"
+Issues = "https://github.com/mr-gl00m/sigil/issues"
+Changelog = "https://github.com/mr-gl00m/sigil/blob/main/CHANGELOG.md"
+Security = "https://github.com/mr-gl00m/sigil/blob/main/SECURITY.md"
+
+[tool.setuptools]
+py-modules = ["sigil", "sigil_audit_proxy", "sigil_llm_adapter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

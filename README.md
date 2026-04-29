@@ -1,16 +1,15 @@
-<p align="center">
-  <img src="sigil_logo.png" alt="Flipbird Sigil" width="200"/>
-</p>
-
-# Flipbird Sigil
+# SIGIL
 ## Sovereign Integrity & Governance Interface Layer
 
 **Open-source LLM prompt security. Zero dependencies on external servers.**
 
 > SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
 
-[![License: CC0-1.0](https://img.shields.io/badge/License-CC0_1.0-lightgrey.svg)](http://creativecommons.org/publicdomain/zero/1.0/)
+**Project site:** [mr-gl00m.github.io/sigil](https://mr-gl00m.github.io/sigil/) (enable GitHub Pages → `main` / `/docs` to activate).
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/mr-gl00m/sigil/actions/workflows/ci.yml/badge.svg)](https://github.com/mr-gl00m/sigil/actions/workflows/ci.yml)
 
 ---
 
@@ -284,6 +283,8 @@ SIGIL makes deliberate trade-offs. Understand them before deploying.
 
 - **UncertaintyGate costs 3x tokens and 3x latency.** Self-consistency voting requires `k_samples=3` by default. Samples are currently generated sequentially. Use it for high-stakes calls only; don't wrap every LLM request in it.
 
+See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for remediation paths and design notes for each item.
+
 ---
 
 ## CLI Reference
@@ -327,22 +328,22 @@ SIGIL proves that a high-integrity, sovereign security layer is not only possibl
 
 ## Support
 
-SIGIL is free and public domain (CC0).
+SIGIL is free and MIT licensed.
 
 If you find this useful, consider supporting development:
 
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mr_gl00m)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://ko-fi.com/mr_gl00m)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/cidthedev)
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sponsors/cidthedev)
 
 **Crypto:**
-- BTC: `bc1qnedeq3dr2dmlwgmw2mr5mtpxh45uhl395prr0d`
-- ETH: `0x1bCbBa9854dA4Fc1Cb95997D5f42006055282e3c`
-- SOL: `3Wm8wS93UpG2CrZsMWHSspJh7M5gQ6NXBbgLHDFXmAdQ`
+- BTC: `bc1qtpc2xqkc9d3lmd0tkp39skprzja2c4q74248u8`
+- ETH: `0xcd27154aE006c77948d70DAf9Cedf84B06Aa4f54`
+- SOL: `75JW7Ay36jgVjDSkQnWa8zTSwQqsHj6sVS6o4WBUC6T7`
 
 ---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+**[MIT License](LICENSE)**
 
-Do whatever you want with this. Fork it, sell it, break it, fix it. No attribution required.
+MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.

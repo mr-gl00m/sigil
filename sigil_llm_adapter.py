@@ -11,18 +11,24 @@ Features:
   - Tool permission enforcement
   - Multi-step workflow state persistence
 
-License: CC0 (Public Domain)
+License: MIT
 """
 
 import json
 import base64
 import binascii
+import hashlib
 import re
 import codecs
 import os
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from sigil_audit_proxy import AuditProxy
 
 from sigil import (
     SigilSeal, SigilRuntime, Architect, AuditChain,
@@ -42,35 +48,94 @@ class InputNormalizer:
     format where safety guardrails actually work.
     """
 
+    # Zero-width and invisible Unicode characters used in homoglyph/smuggling attacks
+    _ZERO_WIDTH_RE = re.compile(
+        '[\u200b\u200c\u200d\u200e\u200f'   # zero-width space, joiners, marks
+        '\u2060\u2061\u2062\u2063\u2064'     # word joiner, invisible operators
+        '\ufeff'                              # BOM / zero-width no-break space
+        '\u00ad'                              # soft hyphen
+        '\u034f'                              # combining grapheme joiner
+        '\u061c'                              # Arabic letter mark
+        '\u180e'                              # Mongolian vowel separator
+        ']'
+    )
+
     # Common encoding patterns that attackers use
-    BASE64_PATTERN = re.compile(r'^[A-Za-z0-9+/=]{20,}$')
-    HEX_PATTERN = re.compile(r'^(?:0x)?[0-9a-fA-F]{20,}$')
+    # Use finditer (no anchors) to catch embedded payloads in natural language
+    # e.g., "Please decode this: SGVsbG8gV29ybGQ=" would be missed by anchored patterns
+    BASE64_PATTERN = re.compile(r'[A-Za-z0-9+/]{20,}={0,2}')
+    HEX_PATTERN = re.compile(r'(?:0x)?[0-9a-fA-F]{20,}')
+    # Keep anchored versions for whole-string checks in detection methods
+    _BASE64_FULL = re.compile(r'^[A-Za-z0-9+/]{20,}={0,2}$')
+    _HEX_FULL = re.compile(r'^(?:0x)?[0-9a-fA-F]{20,}$')
+
+    @classmethod
+    def normalize_unicode(cls, text: str) -> Tuple[str, List[str]]:
+        """
+        Apply NFKC normalization and strip zero-width/invisible characters.
+
+        NFKC collapses fullwidth, compatibility, and confusable codepoints into
+        their canonical form so that safety filters match reliably.
+        """
+        warnings = []
+        # NFKC normalization (e.g., ＩＧＮＯＲＥfullwidth → IGNORE)
+        normalized = unicodedata.normalize("NFKC", text)
+        if normalized != text:
+            warnings.append("UNICODE_NORMALIZATION_APPLIED")
+
+        # Strip zero-width / invisible characters
+        cleaned = cls._ZERO_WIDTH_RE.sub("", normalized)
+        if cleaned != normalized:
+            warnings.append("ZERO_WIDTH_CHARS_STRIPPED")
+
+        return cleaned, warnings
+
+    @classmethod
+    def detect_and_decode_url(cls, text: str) -> Tuple[bool, str]:
+        """Detect and decode URL-encoded content (e.g., %3Cscript%3E)."""
+        if '%' not in text:
+            return False, text
+
+        try:
+            decoded = urllib.parse.unquote(text)
+            if decoded != text:
+                return True, decoded
+        except Exception:
+            pass
+        return False, text
 
     @classmethod
     def detect_and_decode_base64(cls, text: str) -> Tuple[bool, str]:
         """
         Detect and decode Base64-encoded content.
         Returns (was_encoded, decoded_or_original).
+
+        Uses finditer to catch embedded base64 payloads in natural language,
+        not just whole-string encodings (SEC-12).
         """
-        # Skip if too short or contains spaces (unlikely to be pure base64)
+        # First: check if the whole string is base64 (original behavior)
         clean_text = text.strip()
-        if len(clean_text) < 20 or ' ' in clean_text:
-            return False, text
+        if len(clean_text) >= 20 and ' ' not in clean_text:
+            if cls._BASE64_FULL.match(clean_text):
+                try:
+                    decoded = base64.b64decode(clean_text, validate=True)
+                    decoded_str = decoded.decode('utf-8')
+                    if decoded_str.isprintable() or '\n' in decoded_str:
+                        return True, decoded_str
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    pass
 
-        # Check for base64-like pattern
-        if not cls.BASE64_PATTERN.match(clean_text):
-            return False, text
-
-        try:
-            # Attempt decode with validation
-            decoded = base64.b64decode(clean_text, validate=True)
-            decoded_str = decoded.decode('utf-8')
-
-            # Verify it looks like readable text (not binary garbage)
-            if decoded_str.isprintable() or '\n' in decoded_str:
-                return True, decoded_str
-        except (binascii.Error, UnicodeDecodeError, ValueError):
-            pass
+        # Second: scan for embedded base64 payloads within natural language
+        for match in cls.BASE64_PATTERN.finditer(text):
+            candidate = match.group()
+            try:
+                decoded = base64.b64decode(candidate, validate=True)
+                decoded_str = decoded.decode('utf-8')
+                if decoded_str.isprintable() or '\n' in decoded_str:
+                    # Replace the embedded payload with its decoded form
+                    return True, text[:match.start()] + decoded_str + text[match.end():]
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                continue
 
         return False, text
 
@@ -99,24 +164,114 @@ class InputNormalizer:
 
     @classmethod
     def detect_hex_encoding(cls, text: str) -> Tuple[bool, str]:
-        """Detect and decode hex-encoded content."""
-        clean_text = text.strip()
-        if clean_text.startswith('0x'):
-            clean_text = clean_text[2:]
+        """
+        Detect and decode hex-encoded content.
 
-        if not cls.HEX_PATTERN.match(clean_text):
+        Uses finditer to catch embedded hex payloads in natural language,
+        not just whole-string encodings (SEC-12).
+        """
+        # First: check if the whole string is hex (original behavior)
+        clean_text = text.strip()
+        hex_text = clean_text[2:] if clean_text.startswith('0x') else clean_text
+        if cls._HEX_FULL.match(clean_text):
+            try:
+                if len(hex_text) % 2 == 0:
+                    decoded = bytes.fromhex(hex_text).decode('utf-8')
+                    if decoded.isprintable() or '\n' in decoded:
+                        return True, decoded
+            except (ValueError, UnicodeDecodeError):
+                pass
+
+        # Second: scan for embedded hex payloads within natural language
+        for match in cls.HEX_PATTERN.finditer(text):
+            candidate = match.group()
+            hex_part = candidate[2:] if candidate.startswith('0x') else candidate
+            try:
+                if len(hex_part) % 2 != 0:
+                    continue
+                decoded = bytes.fromhex(hex_part).decode('utf-8')
+                if decoded.isprintable() or '\n' in decoded:
+                    return True, text[:match.start()] + decoded + text[match.end():]
+            except (ValueError, UnicodeDecodeError):
+                continue
+
+        return False, text
+
+    @classmethod
+    def detect_and_decode_utf7(cls, text: str) -> Tuple[bool, str]:
+        """Detect and decode UTF-7 encoded content (H-05).
+
+        Looks for ``+<base64>-`` sequences characteristic of UTF-7.
+        """
+        if '+' not in text:
+            return False, text
+
+        # UTF-7 encoded sequences: +<base64>-
+        utf7_pattern = re.compile(r'\+[A-Za-z0-9+/]+-')
+        if not utf7_pattern.search(text):
             return False, text
 
         try:
-            # Must be even length for valid hex
-            if len(clean_text) % 2 != 0:
-                return False, text
-
-            decoded = bytes.fromhex(clean_text).decode('utf-8')
-            if decoded.isprintable() or '\n' in decoded:
+            decoded = text.encode('utf-8').decode('utf-7')
+            # Only flag if decoded text is meaningfully different and printable
+            if decoded != text and decoded.isprintable():
                 return True, decoded
-        except (ValueError, UnicodeDecodeError):
+        except (UnicodeDecodeError, UnicodeEncodeError):
             pass
+
+        return False, text
+
+    @classmethod
+    def detect_and_decode_punycode(cls, text: str) -> Tuple[bool, str]:
+        """Detect punycode-encoded domain labels (``xn--`` prefix) (H-05)."""
+        if 'xn--' not in text.lower():
+            return False, text
+
+        words = text.split()
+        decoded_parts = []
+        found = False
+        for word in words:
+            segments = word.split('.')
+            decoded_segments = []
+            for seg in segments:
+                if seg.lower().startswith('xn--'):
+                    try:
+                        decoded_seg = seg.encode('ascii').decode('idna')
+                        decoded_segments.append(decoded_seg)
+                        found = True
+                    except (UnicodeError, UnicodeDecodeError):
+                        decoded_segments.append(seg)
+                else:
+                    decoded_segments.append(seg)
+            decoded_parts.append('.'.join(decoded_segments))
+
+        if found:
+            return True, ' '.join(decoded_parts)
+        return False, text
+
+    # Leetspeak substitution map
+    _LEET_MAP = {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"}
+    _LEET_ATTACK_PHRASES = {"ignore", "instructions", "system", "prompt", "bypass"}
+
+    @classmethod
+    def detect_leetspeak(cls, text: str) -> Tuple[bool, str]:
+        """Detect leetspeak-encoded attack phrases (H-05).
+
+        Only flags if known attack phrases are found after substitution
+        to prevent false positives on normal text with numbers.
+        """
+        # Quick check: does the text contain any leet characters?
+        if not any(ch in text for ch in cls._LEET_MAP):
+            return False, text
+
+        # Apply substitutions
+        decoded = text.lower()
+        for leet_char, real_char in cls._LEET_MAP.items():
+            decoded = decoded.replace(leet_char, real_char)
+
+        # Check if any attack phrase appears in the decoded text
+        if any(phrase in decoded for phrase in cls._LEET_ATTACK_PHRASES):
+            return True, decoded
 
         return False, text
 
@@ -143,8 +298,27 @@ class InputNormalizer:
         warnings = []
         current_text = user_input
 
+        # Unicode normalization FIRST — before any encoding checks
+        current_text, unicode_warnings = cls.normalize_unicode(current_text)
+        warnings.extend(unicode_warnings)
+
         for depth in range(max_depth):
             changed = False
+
+            was_url, decoded = cls.detect_and_decode_url(current_text)
+            if was_url:
+                warnings.append(f"URL_ENCODING_DETECTED (layer {depth + 1})")
+                current_text = decoded
+                changed = True
+                continue
+
+            # Check UTF-7 (H-05)
+            was_utf7, decoded = cls.detect_and_decode_utf7(current_text)
+            if was_utf7:
+                warnings.append(f"UTF7_ENCODING_DETECTED (layer {depth + 1})")
+                current_text = decoded
+                changed = True
+                continue
 
             # Check Base64
             was_b64, decoded = cls.detect_and_decode_base64(current_text)
@@ -170,6 +344,20 @@ class InputNormalizer:
                     warnings.append(f"ROT13_ENCODING_DETECTED (layer {depth + 1})")
                     current_text = decoded
                     changed = True
+
+            # Check Leetspeak (detection-only, no text replacement) (H-05)
+            if not changed and not any("LEETSPEAK" in w for w in warnings):
+                was_leet, leet_decoded = cls.detect_leetspeak(current_text)
+                if was_leet:
+                    warnings.append(f"LEETSPEAK_DETECTED (layer {depth + 1})")
+                    # Don't replace text — legitimate content could be mangled
+
+            # Check Punycode (detection-only) (H-05)
+            if not changed and not any("PUNYCODE" in w for w in warnings):
+                was_puny, puny_decoded = cls.detect_and_decode_punycode(current_text)
+                if was_puny:
+                    warnings.append(f"PUNYCODE_DETECTED (layer {depth + 1})")
+                    # Don't replace text — keep original domain labels
 
             if not changed:
                 break  # No more encodings found, state stabilized
@@ -259,13 +447,40 @@ PERSONA STABILITY:
         user_input: str,
         conversation_history: Optional[List[Dict]] = None,
         available_tools: Optional[List[Dict]] = None,
-        enable_normalization: bool = True
+        enable_normalization: bool = True,
+        max_input_length: int = 100_000,
+        max_history_entries: int = 100,
     ) -> str:
         """
         Build a complete context window with proper trust boundaries.
 
         Returns a string ready to send to any LLM (Claude, GPT, etc.)
+
+        Args:
+            max_input_length: Truncate user_input beyond this many characters.
+            max_history_entries: Limit conversation_history to this many entries.
         """
+        # Enforce input length limits
+        if len(user_input) > max_input_length:
+            try:
+                AuditChain.log("input_truncated", {
+                    "original_length": len(user_input),
+                    "max_length": max_input_length,
+                })
+            except Exception:
+                pass
+            user_input = user_input[:max_input_length]
+
+        if conversation_history and len(conversation_history) > max_history_entries:
+            try:
+                AuditChain.log("history_truncated", {
+                    "original_entries": len(conversation_history),
+                    "max_entries": max_history_entries,
+                })
+            except Exception:
+                pass
+            conversation_history = conversation_history[-max_history_entries:]
+
         # Comprehensive sanitization: XML injection + encoding detection
         safe_input, security_warnings = ContextArchitect._sanitize_user_input(
             user_input,
@@ -284,22 +499,26 @@ METADATA: {json.dumps(seal.metadata) if seal.metadata else 'none'}
 
 """)
 
-        # Tool definitions (if any)
+        # Tool definitions (if any) — sanitize descriptions/params to prevent injection
         if available_tools:
             context_parts.append("<AVAILABLE_TOOLS>\n")
             for tool in available_tools:
                 if not seal.allowed_tools or tool["name"] in seal.allowed_tools:
-                    context_parts.append(f"""- {tool["name"]}: {tool["description"]}
-  Parameters: {json.dumps(tool.get("parameters", {}))}
+                    safe_desc = tool["description"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    safe_params = json.dumps(tool.get("parameters", {})).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    context_parts.append(f"""- {tool["name"]}: {safe_desc}
+  Parameters: {safe_params}
 """)
             context_parts.append("</AVAILABLE_TOOLS>\n\n")
 
-        # Conversation history (if any)
+        # Conversation history (if any) — sanitize ALL roles to prevent injection
         if conversation_history:
             context_parts.append("<CONVERSATION_HISTORY>\n")
             for msg in conversation_history:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
+                # Sanitize ALL roles including assistant/system — poisoned history can inject via any role
+                content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 context_parts.append(f"[{role.upper()}]: {content}\n")
             context_parts.append("</CONVERSATION_HISTORY>\n\n")
 
@@ -349,6 +568,7 @@ class WorkflowNode:
     transitions: Dict[str, str] = field(default_factory=dict)
     requires_approval: bool = False
     on_error: str = "halt"
+    allowed_context_keys: set = field(default_factory=set)
 
 
 @dataclass
@@ -371,8 +591,9 @@ class WorkflowEngine:
     3. Whether to pause for human approval
     """
 
-    def __init__(self, runtime: SigilRuntime):
+    def __init__(self, runtime: SigilRuntime, strict_transitions: bool = True):
         self.runtime = runtime
+        self.strict_transitions = strict_transitions
         self.workflows: Dict[str, Dict[str, WorkflowNode]] = {}
         self.running: Dict[str, WorkflowState] = {}
 
@@ -451,86 +672,214 @@ After processing the user input, respond with:
 
         return full_context, None
 
+    def process_response(self, response_text: str, state: WorkflowState) -> Optional[str]:
+        """
+        Parse LLM output for transition and context update tags, then advance state.
+
+        Call this after the LLM responds to a step() context. It looks for:
+        - <TRANSITION to="node_id"> to advance to the next workflow node
+        - <CONTEXT_UPDATE key="value"> to store data for later steps
+
+        Returns the next node ID if a transition occurred, or None.
+        """
+        import re
+
+        workflow = self.workflows.get(state.workflow_id, {})
+        current_node = workflow.get(state.current_node)
+
+        # Parse context updates with allowlist enforcement
+        for match in re.finditer(r'<CONTEXT_UPDATE\s+(\w+)="([^"]*)">', response_text):
+            key, value = match.group(1), match.group(2)
+            # If the node has an allowlist, enforce it
+            if current_node and current_node.allowed_context_keys:
+                if key not in current_node.allowed_context_keys:
+                    AuditChain.log("context_update_blocked", {
+                        "workflow_id": state.workflow_id,
+                        "node": state.current_node,
+                        "blocked_key": key,
+                        "step": state.step_count
+                    })
+                    continue
+            state.context_data[key] = value
+
+        # Parse transition
+        transition_match = re.search(r'<TRANSITION\s+to="([^"]+)">', response_text)
+        next_node = None
+        if transition_match:
+            target = transition_match.group(1)
+            # Validate the transition is allowed
+            if current_node and target in current_node.transitions.values():
+                state.current_node = target
+                next_node = target
+                AuditChain.log("workflow_transition", {
+                    "workflow_id": state.workflow_id,
+                    "from_node": state.current_node,
+                    "to_node": target,
+                    "step": state.step_count
+                })
+            elif target in workflow:
+                if self.strict_transitions:
+                    # Strict mode: block undeclared transitions
+                    AuditChain.log("workflow_transition_blocked", {
+                        "workflow_id": state.workflow_id,
+                        "from_node": state.current_node,
+                        "to_node": target,
+                        "step": state.step_count,
+                        "reason": "undeclared_transition"
+                    })
+                else:
+                    # Permissive mode: allow but log warning
+                    state.current_node = target
+                    next_node = target
+                    AuditChain.log("workflow_transition_undeclared", {
+                        "workflow_id": state.workflow_id,
+                        "from_node": state.current_node,
+                        "to_node": target,
+                        "step": state.step_count
+                    })
+
+        # Record assistant response in history
+        state.history.append({"role": "assistant", "content": response_text})
+
+        return next_node
+
 
 # =============================================================================
 # LLM PROVIDER ADAPTERS - Claude, GPT, Local Models
 # =============================================================================
 
 class LLMAdapter:
+    def __init__(
+        self,
+        proxy: Optional["AuditProxy"] = None,
+        verify_tls: bool = True,
+        ca_bundle: Optional[str] = None,
+    ):
+        self.proxy = proxy
+        self.verify_tls = verify_tls
+        self.ca_bundle = ca_bundle
 
-    def complete(self, context: str, max_tokens: int = 1000) -> str:
+        if not verify_tls:
+            try:
+                from sigil import AuditChain as _AC
+                _AC.log("tls_verification_disabled", {"adapter": type(self).__name__})
+            except Exception:
+                pass
+
+    def _get_verify(self):
+        """Return the ``verify`` parameter for httpx calls (M-02)."""
+        if self.ca_bundle:
+            import ssl
+            ctx = ssl.create_default_context(cafile=self.ca_bundle)
+            return ctx
+        return self.verify_tls
+
+    def complete(self, context: str, max_tokens: int = 1000, temperature: Optional[float] = None) -> str:
         raise NotImplementedError
+
+    def _audited_call(
+        self,
+        endpoint: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        provider: str,
+        model: str,
+        timeout: float = 60.0,
+    ) -> str:
+        """Route the request through the AuditProxy when available."""
+        if not self.proxy:
+            raise RuntimeError("AuditProxy not configured for this adapter")
+
+        response_data, _ = self.proxy.audited_request(
+            endpoint=endpoint,
+            headers=headers,
+            body=body,
+            timeout=timeout,
+            provider=provider,
+            model=model,
+        )
+        return self.proxy._extract_response_text(response_data, provider)
 
 
 class ClaudeAdapter(LLMAdapter):
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        if not api_key:
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-20250514", proxy: Optional["AuditProxy"] = None, verify_tls: bool = True, ca_bundle: Optional[str] = None):
+        super().__init__(proxy, verify_tls=verify_tls, ca_bundle=ca_bundle)
+        self.model = model
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
             key_path = Path.home() / ".anthropic" / "api_key"
             if key_path.exists():
                 self.api_key = key_path.read_text().strip()
 
-    def complete(self, context: str, max_tokens: int = 1000) -> str:
+    def complete(self, context: str, max_tokens: int = 1000, temperature: Optional[float] = None) -> str:
+        if not self.api_key:
+            raise ValueError("No API key. Set ANTHROPIC_API_KEY or pass api_key.")
+
+        endpoint = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": context}]
+        }
+        if temperature is not None:
+            body["temperature"] = temperature
+
+        if self.proxy:
+            return self._audited_call(endpoint, headers, body, provider="anthropic", model=body["model"], timeout=60.0)
+
         try:
             import httpx
         except ImportError:
             raise ImportError("Install httpx: pip install httpx")
 
-        if not self.api_key:
-            raise ValueError("No API key. Set ANTHROPIC_API_KEY or pass api_key.")
-
-        response = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": context}]
-            },
-            timeout=60.0
-        )
-
+        response = httpx.post(endpoint, headers=headers, json=body, timeout=60.0, verify=self._get_verify())
         result = response.json()
         return result["content"][0]["text"]
 
 
 class OpenAIAdapter(LLMAdapter):
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        if not api_key:
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4-turbo-preview", proxy: Optional["AuditProxy"] = None, verify_tls: bool = True, ca_bundle: Optional[str] = None):
+        super().__init__(proxy, verify_tls=verify_tls, ca_bundle=ca_bundle)
+        self.model = model
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
             key_path = Path.home() / ".openai" / "api_key"
             if key_path.exists():
                 self.api_key = key_path.read_text().strip()
 
-    def complete(self, context: str, max_tokens: int = 1000) -> str:
+    def complete(self, context: str, max_tokens: int = 1000, temperature: Optional[float] = None) -> str:
+        if not self.api_key:
+            raise ValueError("No API key. Set OPENAI_API_KEY or pass api_key.")
+
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": context}]
+        }
+        if temperature is not None:
+            body["temperature"] = temperature
+
+        if self.proxy:
+            return self._audited_call(endpoint, headers, body, provider="openai", model=body["model"], timeout=60.0)
+
         try:
             import httpx
         except ImportError:
             raise ImportError("Install httpx: pip install httpx")
 
-        if not self.api_key:
-            raise ValueError("No API key. Set OPENAI_API_KEY or pass api_key.")
-
-        response = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "gpt-4-turbo-preview",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": context}]
-            },
-            timeout=60.0
-        )
-
+        response = httpx.post(endpoint, headers=headers, json=body, timeout=60.0, verify=self._get_verify())
         result = response.json()
         return result["choices"][0]["message"]["content"]
 
@@ -542,7 +891,8 @@ class GeminiAdapter(LLMAdapter):
     Get API key from: https://aistudio.google.com/app/apikey
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash-exp", proxy: Optional["AuditProxy"] = None, verify_tls: bool = True, ca_bundle: Optional[str] = None):
+        super().__init__(proxy, verify_tls=verify_tls, ca_bundle=ca_bundle)
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             key_path = Path.home() / ".google" / "api_key"
@@ -551,38 +901,50 @@ class GeminiAdapter(LLMAdapter):
         
         self.model = model
 
-    def complete(self, context: str, max_tokens: int = 1000) -> str:
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError("Install httpx: pip install httpx")
-
+    def complete(self, context: str, max_tokens: int = 1000, temperature: Optional[float] = None) -> str:
         if not self.api_key:
             raise ValueError("No API key. Set GOOGLE_API_KEY or pass api_key.")
 
         # Gemini REST API endpoint
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-        
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        body = {
+            "contents": [{
+                "parts": [{
+                    "text": context
+                }]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": temperature if temperature is not None else 0.7,
+            }
+        }
+
+        if self.proxy:
+            return self._audited_call(
+                endpoint=url,
+                headers=headers,
+                body=body,
+                provider="google",
+                model=self.model,
+                timeout=60.0,
+            )
+
+        try:
+            import httpx
+        except ImportError:
+            raise ImportError("Install httpx: pip install httpx")
+
         response = httpx.post(
             url,
-            headers={
-                "Content-Type": "application/json",
-            },
-            params={
-                "key": self.api_key
-            },
-            json={
-                "contents": [{
-                    "parts": [{
-                        "text": context
-                    }]
-                }],
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens,
-                    "temperature": 0.7,
-                }
-            },
-            timeout=60.0
+            headers=headers,
+            json=body,
+            timeout=60.0,
+            verify=self._get_verify(),
         )
 
         if response.status_code != 200:
@@ -603,11 +965,77 @@ class GeminiAdapter(LLMAdapter):
 
 class OllamaAdapter(LLMAdapter):
 
-    def __init__(self, model: str = "llama2", base_url: str = "http://localhost:11434"):
+    # Cloud metadata and reserved IP patterns that indicate SSRF attempts
+    _BLOCKED_HOSTS = {
+        "169.254.169.254",          # AWS/Azure metadata
+        "metadata.google.internal", # GCP metadata
+        "metadata.internal",        # Generic cloud metadata
+        "100.100.100.200",          # Alibaba Cloud metadata
+    }
+
+    @staticmethod
+    def _validate_base_url(url: str):
+        """Validate base URL is not targeting cloud metadata or reserved IPs."""
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname or ""
+
+        # Block known cloud metadata endpoints
+        if hostname in OllamaAdapter._BLOCKED_HOSTS:
+            raise ValueError(f"SSRF protection: blocked request to metadata endpoint '{hostname}'")
+
+        # Block link-local range (169.254.0.0/16)
+        try:
+            import ipaddress
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_link_local:
+                raise ValueError(f"SSRF protection: blocked request to link-local address '{hostname}'")
+            if addr.is_reserved and not addr.is_loopback and not addr.is_private:
+                raise ValueError(f"SSRF protection: blocked request to reserved address '{hostname}'")
+        except ValueError as e:
+            if "SSRF" in str(e):
+                raise
+            # hostname is not an IP literal — that's fine (e.g. "localhost")
+
+    def __init__(
+        self,
+        model: str = "llama2",
+        base_url: str = "http://localhost:11434",
+        proxy: Optional["AuditProxy"] = None,
+        timeout: Optional[float] = None,
+        verify_tls: bool = True,
+        ca_bundle: Optional[str] = None,
+    ):
+        super().__init__(proxy, verify_tls=verify_tls, ca_bundle=ca_bundle)
+        self._validate_base_url(base_url)
         self.model = model
         self.base_url = base_url
+        env_timeout = os.getenv("OLLAMA_TIMEOUT_SECONDS")
+        self.timeout = timeout if timeout is not None else (float(env_timeout) if env_timeout else None)
 
-    def complete(self, context: str, max_tokens: int = 1000) -> str:
+    def complete(self, context: str, max_tokens: int = 1000, temperature: Optional[float] = None) -> str:
+        # Re-validate base_url before each request in case it was mutated
+        self._validate_base_url(self.base_url)
+        options: Dict[str, Any] = {"num_predict": max_tokens}
+        if temperature is not None:
+            options["temperature"] = temperature
+        payload = {
+            "model": self.model,
+            "prompt": context,
+            "stream": False,
+            "options": options
+        }
+
+        if self.proxy:
+            endpoint = f"{self.base_url}/api/generate"
+            return self._audited_call(
+                endpoint=endpoint,
+                headers={},
+                body=payload,
+                provider="ollama",
+                model=self.model,
+                timeout=self.timeout if self.timeout is not None else 120.0,
+            )
+
         try:
             import httpx
         except ImportError:
@@ -615,13 +1043,9 @@ class OllamaAdapter(LLMAdapter):
 
         response = httpx.post(
             f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": context,
-                "stream": False,
-                "options": {"num_predict": max_tokens}
-            },
-            timeout=120.0
+            json=payload,
+            timeout=self.timeout,
+            verify=self._get_verify(),
         )
 
         return response.json()["response"]
@@ -768,11 +1192,11 @@ class UncertaintyGate:
 
         Returns a ConsistencyResult with the response or abstention.
         """
-        # Generate K responses
+        # Generate K responses with temperature for diverse sampling
         responses = []
         for _ in range(self.k_samples):
             try:
-                response = self.llm.complete(context, max_tokens)
+                response = self.llm.complete(context, max_tokens, temperature=self.temperature)
                 responses.append(response)
             except Exception as e:
                 AuditChain.log("uncertainty_generation_error", {"error": str(e)})
@@ -860,10 +1284,15 @@ class ToolRegistry:
         if tool_name not in self.tools:
             raise ValueError(f"Unknown tool: {tool_name}")
 
+        kwargs_preview = {k: str(v)[:100] for k, v in kwargs.items()}
+        kwargs_hash = hashlib.sha256(
+            json.dumps(kwargs, sort_keys=True, default=str).encode()
+        ).hexdigest()
         AuditChain.log("tool_executed", {
             "tool": tool_name,
             "seal_node": seal.node_id,
-            "kwargs": {k: str(v)[:50] for k, v in kwargs.items()}
+            "kwargs_preview": kwargs_preview,
+            "kwargs_hash": kwargs_hash,
         })
 
         return self.tools[tool_name](**kwargs)
@@ -1085,7 +1514,7 @@ Always be helpful and professional.""",
 |           Base64/ROT13/Hex decoded before LLM sees it                       |
 |                                                                             |
 |  Layer 4: HTML Entity Escaping                                              |
-|           All < and > escaped - zero tag breakout risk                      |
+|           All < and > escaped in user input and conversation history        |
 |                                                                             |
 |  Layer 5: Persona Stability Preamble                                        |
 |           "Pretend you are..." treated as DATA, not command                 |
