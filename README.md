@@ -5,7 +5,8 @@
 
 > SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
 
-**Project site:** [mr-gl00m.github.io/sigil](https://mr-gl00m.github.io/sigil/) (enable GitHub Pages → `main` / `/docs` to activate).
+<p align="center">
+  <img src="sigil_logo.png" alt="SIGIL" width="200"/>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -143,6 +144,7 @@ response = adapter.complete(context)
 | Anthropic Claude | `ClaudeAdapter` | claude-sonnet-4-20250514 | Pass `model=` to override |
 | OpenAI GPT | `OpenAIAdapter` | gpt-4-turbo-preview | Pass `model=` to override |
 | Local (Ollama) | `OllamaAdapter` | llama2 | llama3.2, mistral, phi, etc. |
+| DeepSeek | `---` | --- | Coming Soon |
 
 #### Audit Proxy signals
 
@@ -326,11 +328,11 @@ SIGIL proves that a high-integrity, sovereign security layer is not only possibl
 
 ---
 
+## License
+[MIT](./LICENSE). Copyright © 2026 Nathan Seals / Nexus Labs. Use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
+
 ## Support
-
-SIGIL is free and MIT licensed.
-
-If you find this useful, consider supporting development:
+SIGIL is free and MIT licensed. If you find this useful, consider supporting development:
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/cidthedev)
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sponsors/cidthedev)
@@ -339,11 +341,3 @@ If you find this useful, consider supporting development:
 - BTC: `bc1qtpc2xqkc9d3lmd0tkp39skprzja2c4q74248u8`
 - ETH: `0xcd27154aE006c77948d70DAf9Cedf84B06Aa4f54`
 - SOL: `75JW7Ay36jgVjDSkQnWa8zTSwQqsHj6sVS6o4WBUC6T7`
-
----
-
-## License
-
-**[MIT License](LICENSE)**
-
-MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
