@@ -326,24 +326,16 @@ SIGIL proves that a high-integrity, sovereign security layer is not only possibl
 
 ---
 
-## Support
-
-SIGIL is free and MIT licensed.
-
-If you find this useful, consider supporting development:
-
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/cidthedev)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sponsors/cidthedev)
-
-**Crypto:**
-- BTC: `bc1qtpc2xqkc9d3lmd0tkp39skprzja2c4q74248u8`
-- ETH: `0xcd27154aE006c77948d70DAf9Cedf84B06Aa4f54`
-- SOL: `75JW7Ay36jgVjDSkQnWa8zTSwQqsHj6sVS6o4WBUC6T7`
-
----
-
 ## License
-
 [MIT](./LICENSE). Copyright © 2026 Nathan Seals / Nexus Labs
 
-MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
+## Support Me
+If you find this useful, consider supporting me and my research:
+
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mr_gl00m)
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://ko-fi.com/mr_gl00m)
+
+**Crypto:**
+- BTC: `bc1qnedeq3dr2dmlwgmw2mr5mtpxh45uhl395prr0d`
+- ETH: `0x1bCbBa9854dA4Fc1Cb95997D5f42006055282e3c`
+- SOL: `3Wm8wS93UpG2CrZsMWHSspJh7M5gQ6NXBbgLHDFXmAdQ`
