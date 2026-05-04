@@ -3,9 +3,10 @@
 
 **Open-source LLM prompt security. Zero dependencies on external servers.**
 
-> SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
+<p align="center">
+  <img src="sigil_logo.png" alt="SIGIL" width="200"/>
 
-**Project site:** [mr-gl00m.github.io/sigil](https://mr-gl00m.github.io/sigil/) (enable GitHub Pages → `main` / `/docs` to activate).
+> SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
