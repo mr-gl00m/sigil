@@ -135,3 +135,38 @@ def test_adapter_ca_bundle_parameter():
     """ca_bundle parameter is accepted and stored."""
     adapter = ClaudeAdapter(api_key="test", ca_bundle="/path/to/ca.pem")
     assert adapter.ca_bundle == "/path/to/ca.pem"
+
+
+# --- RT-2026-05-01-006: Ollama remote opt-in gate ---
+
+
+def test_ollama_localhost_default_works(monkeypatch):
+    """Default localhost base_url is always allowed."""
+    monkeypatch.delenv("OLLAMA_ALLOW_REMOTE", raising=False)
+    OllamaAdapter()  # default base_url is http://localhost:11434
+    OllamaAdapter(base_url="http://127.0.0.1:11434")
+    OllamaAdapter(base_url="http://[::1]:11434")
+
+
+@pytest.mark.parametrize("remote_url", [
+    "http://192.168.1.50:11434",       # private LAN
+    "http://10.0.0.5:11434",           # RFC1918
+    "http://ollama.example.com:11434", # public DNS
+])
+def test_ollama_remote_blocked_without_optin(monkeypatch, remote_url):
+    """RT-2026-05-01-006: remote Ollama hosts must require an explicit opt-in."""
+    monkeypatch.delenv("OLLAMA_ALLOW_REMOTE", raising=False)
+    with pytest.raises(ValueError, match="OLLAMA_ALLOW_REMOTE"):
+        OllamaAdapter(base_url=remote_url)
+
+
+def test_ollama_remote_allowed_with_optin(monkeypatch):
+    """OLLAMA_ALLOW_REMOTE=1 permits a remote host (operator opt-in)."""
+    monkeypatch.setenv("OLLAMA_ALLOW_REMOTE", "1")
+    OllamaAdapter(base_url="http://ollama.example.com:11434")
+
+
+def test_ollama_remote_allowed_with_constructor_flag(monkeypatch):
+    """allow_remote=True permits a remote host without the env var."""
+    monkeypatch.delenv("OLLAMA_ALLOW_REMOTE", raising=False)
+    OllamaAdapter(base_url="http://ollama.example.com:11434", allow_remote=True)

@@ -175,6 +175,48 @@ def _ensure_dirs():
 
 
 # =============================================================================
+# ATOMIC FILE WRITE HELPERS (RT-2026-05-01-003 — durable replace)
+# =============================================================================
+
+# Crash-safe replace: write to a sibling temp file, fsync the file, then
+# os.replace into place. A power loss or kill -9 mid-write leaves either the
+# old contents or the new contents — never a truncated half-file.
+def _atomic_write_bytes(path: Path, data: bytes, *, mode: Optional[int] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)
+            except (OSError, NotImplementedError):
+                pass
+        os.replace(tmp, path)
+        # Best-effort directory fsync — not supported on Windows, hence the guard.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            pass
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: Optional[int] = None) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+
+
+# =============================================================================
 # ENCRYPTED STATE FILE HELPERS (SEC-01 — state at-rest encryption)
 # =============================================================================
 
@@ -199,13 +241,9 @@ def _get_state_encryption_key() -> bytes:
             _ensure_dirs()
             sk = nacl.signing.SigningKey.generate()
             sk_hex = sk.encode(encoder=nacl.encoding.HexEncoder)
-            key_path.write_bytes(sk_hex)
-            try:
-                key_path.chmod(0o600)
-            except (OSError, NotImplementedError):
-                pass
+            _atomic_write_bytes(key_path, sk_hex, mode=0o600)
             pub_path = KEYS_DIR / "_system.pub"
-            pub_path.write_bytes(sk.verify_key.encode(encoder=nacl.encoding.HexEncoder))
+            _atomic_write_bytes(pub_path, sk.verify_key.encode(encoder=nacl.encoding.HexEncoder), mode=0o644)
             raw = sk_hex
         else:
             raw = key_path.read_bytes()
@@ -217,17 +255,14 @@ def _write_encrypted_state(path: Path, data: dict) -> None:
     """Write a dict as encrypted JSON to a state file.
 
     Uses XSalsa20-Poly1305 (NaCl SecretBox) with a key derived from the
-    system signing key. File permissions are set to 0o600 on Unix.
+    system signing key. Written atomically (tmp + fsync + os.replace) so a
+    crash mid-write cannot leave a truncated state file.
     """
     key = _get_state_encryption_key()
     box = nacl.secret.SecretBox(key)
     plaintext = json.dumps(data, indent=2).encode()
     ciphertext = box.encrypt(plaintext)
-    path.write_bytes(ciphertext)
-    try:
-        path.chmod(0o600)
-    except (OSError, NotImplementedError):
-        pass  # Windows may not support chmod
+    _atomic_write_bytes(path, ciphertext, mode=0o600)
 
 
 def _read_encrypted_state(path: Path) -> dict:
@@ -410,17 +445,11 @@ class Keyring:
         sk = nacl.signing.SigningKey.generate()
 
         if passphrase:
-            key_path.write_bytes(Keyring._encrypt_key(sk.encode(), passphrase))
+            _atomic_write_bytes(key_path, Keyring._encrypt_key(sk.encode(), passphrase), mode=0o600)
         else:
-            key_path.write_bytes(sk.encode(encoder=nacl.encoding.HexEncoder))
+            _atomic_write_bytes(key_path, sk.encode(encoder=nacl.encoding.HexEncoder), mode=0o600)
 
-        # Set permissions (Windows-compatible)
-        try:
-            key_path.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass  # Windows doesn't support Unix permissions
-
-        pub_path.write_bytes(sk.verify_key.encode(encoder=nacl.encoding.HexEncoder))
+        _atomic_write_bytes(pub_path, sk.verify_key.encode(encoder=nacl.encoding.HexEncoder), mode=0o644)
 
         return key_path, pub_path
 
@@ -446,7 +475,7 @@ class Keyring:
 
         if pin_id not in pins:
             pins[pin_id] = fingerprint
-            pins_path.write_text(json.dumps(pins, indent=2))
+            _atomic_write_text(pins_path, json.dumps(pins, indent=2))
 
     @staticmethod
     def _verify_key_pin(name: str, key_type: str, key_bytes: bytes) -> bool:
@@ -673,14 +702,9 @@ class Keyring:
         if Keyring._is_encrypted_key(file_data):
             raise ValueError(f"Key '{name}' is already encrypted")
 
-        # Load the plaintext key, encrypt, overwrite
+        # Load the plaintext key, encrypt, overwrite atomically (RT-2026-05-04-001).
         sk = nacl.signing.SigningKey(file_data, encoder=nacl.encoding.HexEncoder)
-        key_path.write_bytes(Keyring._encrypt_key(sk.encode(), passphrase))
-
-        try:
-            key_path.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+        _atomic_write_bytes(key_path, Keyring._encrypt_key(sk.encode(), passphrase), mode=0o600)
 
         AuditChain.log("key_migrated_to_encrypted", {"key_name": name})
 
@@ -702,9 +726,9 @@ class Keyring:
 
     @staticmethod
     def _save_succession_records(records: list):
-        """Save key succession records."""
+        """Save key succession records (RT-2026-05-04-001: atomic)."""
         _ensure_dirs()
-        Keyring._succession_path().write_text(json.dumps(records, indent=2))
+        _atomic_write_text(Keyring._succession_path(), json.dumps(records, indent=2))
 
     @staticmethod
     def rotate_key(name: str, new_passphrase: Optional[str] = None, transition_days: int = 7) -> tuple[Path, Path]:
@@ -735,11 +759,11 @@ class Keyring:
             old_sk.verify_key.encode(encoder=nacl.encoding.HexEncoder)
         ).hexdigest()[:16]
 
-        # Archive old key
+        # Archive old key (RT-2026-05-04-001: atomic)
         archive_key = KEYS_DIR / f"{name}_v{current_version}.key"
         archive_pub = KEYS_DIR / f"{name}_v{current_version}.pub"
-        archive_key.write_bytes(key_path.read_bytes())
-        archive_pub.write_bytes(pub_path.read_bytes())
+        _atomic_write_bytes(archive_key, key_path.read_bytes(), mode=0o600)
+        _atomic_write_bytes(archive_pub, pub_path.read_bytes(), mode=0o644)
 
         # Generate new key
         new_sk = nacl.signing.SigningKey.generate()
@@ -748,15 +772,10 @@ class Keyring:
         ).hexdigest()[:16]
 
         if new_passphrase:
-            key_path.write_bytes(Keyring._encrypt_key(new_sk.encode(), new_passphrase))
+            _atomic_write_bytes(key_path, Keyring._encrypt_key(new_sk.encode(), new_passphrase), mode=0o600)
         else:
-            key_path.write_bytes(new_sk.encode(encoder=nacl.encoding.HexEncoder))
-        pub_path.write_bytes(new_sk.verify_key.encode(encoder=nacl.encoding.HexEncoder))
-
-        try:
-            key_path.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
+            _atomic_write_bytes(key_path, new_sk.encode(encoder=nacl.encoding.HexEncoder), mode=0o600)
+        _atomic_write_bytes(pub_path, new_sk.verify_key.encode(encoder=nacl.encoding.HexEncoder), mode=0o644)
 
         # Create succession record signed by old key
         rotated_at = datetime.now(timezone.utc).isoformat()
@@ -776,7 +795,7 @@ class Keyring:
         records.append(record)
         Keyring._save_succession_records(records)
 
-        # Update key pin to new key
+        # Update key pin to new key (RT-2026-05-04-001: atomic)
         pins_path = Keyring._key_pins_path()
         if pins_path.exists():
             try:
@@ -785,7 +804,7 @@ class Keyring:
                     pin_id = f"{name}_{suffix}"
                     if pin_id in pins:
                         del pins[pin_id]
-                pins_path.write_text(json.dumps(pins, indent=2))
+                _atomic_write_text(pins_path, json.dumps(pins, indent=2))
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1053,7 +1072,7 @@ class Architect:
                 "signer_key_id": self.key_id,
             })
 
-            CRL_FILE.write_text(json.dumps(crl, indent=2))
+            _atomic_write_text(CRL_FILE, json.dumps(crl, indent=2))
         print(f"Revoked: {seal.node_id} ({seal.content_hash()[:16]}...)")
 
 
@@ -1704,6 +1723,20 @@ class HumanGate:
     MAX_FAILED_ATTEMPTS = 5
     LOCKOUT_DURATION_SECONDS = 300  # 5 minutes
 
+    # RT-2026-05-04-002: state_id is opaque, generated by request_approval as
+    # sha256(os.urandom(32))[:24]. Anything that doesn't match is path-traversal
+    # bait; refuse before constructing a STATE_DIR path from it.
+    _STATE_ID_RE = _re_module.compile(r"^[a-f0-9]{24}$")
+
+    @staticmethod
+    def _validate_state_id(state_id: str) -> None:
+        """Refuse state_ids that don't match the request_approval shape."""
+        if not isinstance(state_id, str) or not HumanGate._STATE_ID_RE.match(state_id):
+            raise ValueError(
+                "Invalid state_id. Expected 24 hex characters (matching the "
+                "value returned by HumanGate.request_approval)."
+            )
+
     def __init__(self, operator_key: str = "operator"):
         self.operator_key = operator_key
 
@@ -1808,6 +1841,7 @@ class HumanGate:
 
     def check_approval(self, state_id: str) -> Optional[PausedState]:
         """Check if a state has been approved. Returns state if approved."""
+        HumanGate._validate_state_id(state_id)
         state_file = STATE_DIR / f"pending_{state_id}.json"
         if not state_file.exists():
             return None
@@ -1854,6 +1888,7 @@ class HumanGate:
     @staticmethod
     def approve(state_id: str, operator_key: str = "operator"):
         """Operator signs the approval."""
+        HumanGate._validate_state_id(state_id)
         _ensure_dirs()
 
         # Check lockout before processing (H-02)
@@ -1965,15 +2000,12 @@ class AuditChain:
             if key_path.exists():
                 sk = nacl.signing.SigningKey(key_path.read_bytes(), encoder=nacl.encoding.HexEncoder)
             else:
-                # Auto-generate system key (no log call — avoids recursion)
+                # Auto-generate system key (no AuditChain.log — avoids recursion).
+                # RT-2026-05-04-001: atomic helper is pure I/O, safe from recursion.
                 _ensure_dirs()
                 sk = nacl.signing.SigningKey.generate()
-                key_path.write_bytes(sk.encode(encoder=nacl.encoding.HexEncoder))
-                try:
-                    key_path.chmod(0o600)
-                except (OSError, NotImplementedError):
-                    pass
-                pub_path.write_bytes(sk.verify_key.encode(encoder=nacl.encoding.HexEncoder))
+                _atomic_write_bytes(key_path, sk.encode(encoder=nacl.encoding.HexEncoder), mode=0o600)
+                _atomic_write_bytes(pub_path, sk.verify_key.encode(encoder=nacl.encoding.HexEncoder), mode=0o644)
 
             key_id = hashlib.sha256(
                 sk.verify_key.encode(encoder=nacl.encoding.HexEncoder)
@@ -2042,8 +2074,12 @@ class AuditChain:
             entry["signature"] = signature
             entry["signer_key_id"] = key_id
 
+            # Append + fsync so a crash after the append leaves the entry on
+            # disk rather than in the OS buffer (RT-2026-05-01-003).
             with open(cls.LOG_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             # Restrict audit log file permissions (SEC-01)
             try:
                 cls.LOG_FILE.chmod(0o600)
@@ -2067,18 +2103,25 @@ class AuditChain:
         if cls.LOG_FILE.stat().st_size == 0:
             return True, "Audit log is empty"
 
-        # Try to load system public key for signature verification
+        # Load system public key for signature verification.
+        # If signed entries exist but the pubkey is missing or malformed, we fail
+        # closed at the first signed entry — see RT-2026-05-01-002. A patient
+        # local attacker who can rewrite chain.jsonl can also delete _system.pub,
+        # so treating "no key" as "skip verification" would silently accept a
+        # tampered chain.
         system_vk = None
+        system_vk_load_error: Optional[str] = None
         pub_path = KEYS_DIR / "_system.pub"
         if pub_path.exists():
             try:
                 system_vk = nacl.signing.VerifyKey(pub_path.read_bytes(), encoder=nacl.encoding.HexEncoder)
-            except Exception:
-                pass
+            except (ValueError, TypeError, CryptoError) as e:
+                system_vk_load_error = f"{type(e).__name__}: {e}"
+        else:
+            system_vk_load_error = "_system.pub does not exist"
 
         prev_hash = "GENESIS"
         unsigned_count = 0
-        unverifiable_count = 0
         entry_count = 0
 
         with open(cls.LOG_FILE, 'r') as f:
@@ -2109,16 +2152,19 @@ class AuditChain:
                 if calculated_hash != stored_hash:
                     return False, f"Entry {entry_count} has been tampered with"
 
-                # Signature verification
+                # Signature verification — fail closed if a signed entry exists
+                # but we have no usable system public key (RT-2026-05-01-002).
                 sig_hex = entry.get("signature")
                 if sig_hex:
-                    if system_vk:
-                        try:
-                            system_vk.verify(stored_hash.encode(), bytes.fromhex(sig_hex))
-                        except BadSignatureError:
-                            return False, f"Entry {entry_count} has invalid signature"
-                    else:
-                        unverifiable_count += 1
+                    if system_vk is None:
+                        return False, (
+                            f"Entry {entry_count} has signature but system public key "
+                            f"is missing or unreadable ({system_vk_load_error})"
+                        )
+                    try:
+                        system_vk.verify(stored_hash.encode(), bytes.fromhex(sig_hex))
+                    except BadSignatureError:
+                        return False, f"Entry {entry_count} has invalid signature"
                 else:
                     unsigned_count += 1
                     if strict:
@@ -2133,8 +2179,6 @@ class AuditChain:
         parts = [f"Chain valid: {entry_count} entries"]
         if unsigned_count:
             parts.append(f"{unsigned_count} unsigned")
-        if unverifiable_count:
-            parts.append(f"{unverifiable_count} unverifiable (no system key)")
         return True, ", ".join(parts)
 
 
@@ -2535,6 +2579,35 @@ class CodeProvenance:
 # CLI INTERFACE
 # =============================================================================
 
+# RT-2026-05-01-007: cap the bytes a CLI command will read from a prompt
+# bundle before parsing JSON. A crafted local file could otherwise OOM the
+# process before any structural validation runs. 4 MiB easily covers a
+# realistic batch of seals; operators can widen via SIGIL_PROMPT_BUNDLE_MAX_BYTES.
+_PROMPT_BUNDLE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _load_prompt_bundle(path: Path) -> dict:
+    """Read and JSON-decode a CLI prompt bundle, refusing oversized files.
+
+    Checks st_size before reading so a 10 GiB file does not get loaded.
+    """
+    cap_env = os.getenv("SIGIL_PROMPT_BUNDLE_MAX_BYTES")
+    if cap_env:
+        try:
+            cap = int(cap_env)
+        except ValueError:
+            cap = _PROMPT_BUNDLE_MAX_BYTES
+    else:
+        cap = _PROMPT_BUNDLE_MAX_BYTES
+
+    size = path.stat().st_size
+    if size > cap:
+        raise ValueError(
+            f"Prompt bundle {path} ({size} bytes) exceeds prompt-bundle size cap ({cap} bytes). "
+            f"Set SIGIL_PROMPT_BUNDLE_MAX_BYTES if you need a larger cap."
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
 def cli():
     """Command-line interface for SIGIL."""
     import argparse
@@ -2614,7 +2687,7 @@ Examples:
 
     elif args.command == "sign":
         architect = Architect()
-        prompts = json.loads(Path(args.input).read_text())
+        prompts = _load_prompt_bundle(Path(args.input))
         signed = {}
 
         for node_id, data in prompts.items():
@@ -2629,12 +2702,14 @@ Examples:
             print(f"Signed: {node_id}")
 
         output = args.output or args.input.replace(".json", "_signed.json")
-        Path(output).write_text(json.dumps(signed, indent=2))
+        # RT-2026-05-04-007: atomic so a half-written signed bundle from a
+        # crashed sign run does not look like a corrupt seal on the next verify.
+        _atomic_write_text(Path(output), json.dumps(signed, indent=2))
         print(f"\nSaved to: {output}")
 
     elif args.command == "verify":
         sentinel = Sentinel()
-        signed = json.loads(Path(args.input).read_text())
+        signed = _load_prompt_bundle(Path(args.input))
 
         for node_id, data in signed.items():
             try:
@@ -2757,7 +2832,9 @@ Examples:
         else:
             report_lines.append("- None recorded")
 
-        report_path.write_text("\n".join(report_lines))
+        # RT-2026-05-04-007: atomic so a half-written report cannot land in
+        # a downstream compliance pipeline.
+        _atomic_write_text(report_path, "\n".join(report_lines))
         print(f"Report written to {report_path}")
 
     elif args.command == "demo":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigil-security"
-version = "1.6.1"
+version = "1.7.0"
 description = "Sovereign Integrity & Governance Interface Layer — open-source cryptographic prompt security for agentic LLM systems."
 readme = "README.md"
 requires-python = ">=3.8"

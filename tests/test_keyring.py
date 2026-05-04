@@ -208,3 +208,80 @@ def test_key_permission_check_verifier_on_load():
     with patch.object(Keyring, '_check_key_permissions') as mock_check:
         Keyring.load_verifier("perm_ver")
         assert mock_check.called
+
+
+# --- RT-2026-05-04-001: atomic-write sweep on rotation flow ---
+
+
+def test_rotate_key_routes_writes_through_atomic_helper(sigil_isolation, monkeypatch):
+    """RT-2026-05-04-001: every persistent write inside rotate_key must go
+    through _atomic_write_*, observable as os.replace calls. Pre-fix the
+    rotation used raw write_bytes/write_text and would not invoke os.replace
+    at all for the new key, new pub, succession records, or pin update."""
+    Keyring.generate("rot_atomic")
+    # Trigger pin creation so rotate_key has a pin to clean up
+    Keyring.load_signer("rot_atomic")
+
+    real_replace = os.replace
+    replace_targets: list[str] = []
+
+    def counting_replace(src, dst):
+        replace_targets.append(str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", counting_replace)
+    Keyring.rotate_key("rot_atomic")
+
+    # Expected atomic targets: archive .key, archive .pub, new .key, new .pub,
+    # succession records, and the pin file. At least 4 — the pin write is
+    # conditional on a pre-existing pin entry, so 4 is the floor.
+    assert len(replace_targets) >= 4, (
+        f"rotate_key only invoked os.replace {len(replace_targets)} times. "
+        f"Expected >=4 atomic writes. Targets: {replace_targets}"
+    )
+
+
+def test_migrate_key_routes_write_through_atomic_helper(sigil_isolation, monkeypatch):
+    """RT-2026-05-04-001: migrate_key (plaintext -> encrypted) must use the
+    atomic helper so a crash mid-write cannot truncate the only copy of the
+    signing key."""
+    Keyring.generate("mig_atomic")
+
+    real_replace = os.replace
+    replace_targets: list[str] = []
+
+    def counting_replace(src, dst):
+        replace_targets.append(str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", counting_replace)
+    Keyring.migrate_key("mig_atomic", "passphrase123")
+
+    assert any("mig_atomic.key" in t for t in replace_targets), (
+        f"migrate_key did not route the key write through os.replace. "
+        f"Targets: {replace_targets}"
+    )
+
+
+def test_audit_chain_system_keypair_bootstrap_uses_atomic_writes(sigil_isolation, monkeypatch):
+    """RT-2026-05-04-001: AuditChain._get_system_signer auto-generates the
+    _system.key/_system.pub on first use. That bootstrap path must also use
+    the atomic helper — losing _system.pub mid-write breaks every signed
+    audit-chain entry's verification."""
+    real_replace = os.replace
+    replace_targets: list[str] = []
+
+    def counting_replace(src, dst):
+        replace_targets.append(str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", counting_replace)
+    # Trigger bootstrap by logging an audit entry on a fresh _system key
+    sigil.AuditChain.log("test_bootstrap", {"k": 1})
+
+    assert any("_system.key" in t for t in replace_targets), (
+        f"_system.key bootstrap did not use os.replace. Targets: {replace_targets}"
+    )
+    assert any("_system.pub" in t for t in replace_targets), (
+        f"_system.pub bootstrap did not use os.replace. Targets: {replace_targets}"
+    )

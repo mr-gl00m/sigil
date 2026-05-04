@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-05-04
+
+### Highlights
+
+- **Cryptographic proof-of-conditioning per request.** New `IntegrityReceipt` primitive embeds an HMAC canary in the prompt context that the model is instructed to echo. SIGIL recomputes the HMAC against the system signing key and verifies the response carried a valid receipt. A model that bypassed `IRONCLAD_CONTEXT` cannot fabricate a matching canary because it doesn't hold the key. This is the closest thing to a soundness check on whether the model actually conditioned on the seal.
+- **Embedding-based `UncertaintyGate` replaces Jaccard word-overlap.** The old similarity metric passed "Yes, transfer the funds" and "No, don't transfer the funds" as consistent because they share most stop-word-stripped tokens. Cosine on Ollama embeddings (`nomic-embed-text` by default) catches the semantic flip. Hard dep on a reachable Ollama instance; fails closed on `EmbeddingError`.
+- **26 red-team findings closed across three remediation rounds.** Hardening across atomic-write coverage, SSRF allowlists, secret redaction in audit logs, key separation in the HMAC-receipt path, deny-by-default tool allowlists, path-traversal prevention in the human-gate, and a dozen smaller items.
+
+### Added
+
+- `IntegrityReceipt` class — HMAC-based proof-of-conditioning per request. `embed(seal) -> (nonce, canary, block_string)` and `verify(seal, context, response) -> (bool, reason)`.
+- `EmbeddingClient` class — thin Ollama `/api/embeddings` client backing the new `UncertaintyGate`. Honors `OLLAMA_ALLOW_REMOTE`, `verify_tls`, `ca_bundle`, and writes per-call audit-chain entries.
+- `_PerSealAnomalyTracker` — rolling-window statistical anomaly detection per `SigilSeal.node_id`. Fires `*_OUTLIER_FOR_SEAL` reasons when a record is ≥3σ off the seal's own baseline.
+- `ToolRegistry.execute_validated(seal, invocation)` — supported dispatch path for capability-bearing seals. Re-verifies that `seal.capabilities[capability_id]` matches `invocation.resolved_tool` before running.
+- `requirements-lock.txt` — pinned application install lockfile for reproducible builds.
+- `node_id` and `integrity_receipt_verified` fields on `AuditRecord`.
+- New operator knobs (env var or kwarg, see README): `OLLAMA_ALLOW_REMOTE`, `SIGIL_PROMPT_BUNDLE_MAX_BYTES`, `SIGIL_NORMALIZE_MAX_BYTES`, `SIGIL_PER_SEAL_TRACKER_MAX`, `OLLAMA_TIMEOUT_SECONDS`, `verify_tls` / `ca_bundle` on `EmbeddingClient`, `verify` / `node_id` / `seal` / `prompt_context` on `AuditProxy.audited_request`, `allow_remote` / `verify_tls` / `ca_bundle` on `OllamaAdapter`, `stream_capture_cap` on `AuditProxy`.
+
+### Changed
+
+- **Breaking: `InputNormalizer.normalize` now redacts encoded payloads instead of decoding them into the prompt.** Previously, detected base64 / hex / ROT13 / URL / UTF-7 payloads were decoded and returned with a `[DECODED_PAYLOAD]` prefix — that did the attacker's first-stage work. The new behavior replaces each encoded slice with `[REDACTED-BASE64-{hash}]`-style markers and logs the original + decoded form to `AuditChain` (`input_payload_redacted` event). The model never sees the decoded payload. Callers that depended on `normalize()` returning decoded text will see a redaction marker instead. Slices that don't decode as printable UTF-8 (binary hashes, file signatures) are preserved.
+- **Breaking: `ToolRegistry.execute(tool_name, seal)` refuses capability-bearing seals.** A seal with non-empty `capabilities` map now rejects the raw-tool-name path with `PermissionError`. Use `SigilRuntime.validate_and_execute` → `ToolRegistry.execute_validated(seal, invocation)`. Legacy seals (no `capabilities` map) keep working unchanged.
+- **Breaking: `UncertaintyGate` similarity metric switched from Jaccard to embedding cosine.** Default `consistency_threshold` raised 0.6 → 0.7 to match the cosine scale. Constructing the gate requires a reachable Ollama instance unless an `embedding_client=` is injected (tests). Fails closed with `EmbeddingError` rather than silently falling back.
+- **Breaking: `HumanGate.approve` and `check_approval` reject `state_id` values that don't match `^[a-f0-9]{24}$`** (the shape `request_approval` produces). Closes a path-traversal where `state_id="../tmp/foo"` could write encrypted state outside `STATE_DIR`.
+- **Breaking: `AuditChain.verify_chain` fails closed when signed entries exist but `_system.pub` is missing or unreadable.** Earlier versions skipped signature enforcement and reported success.
+- **Breaking: empty `SigilSeal.allowed_tools` denies all tools.** Previously treated as "all tools allowed" — inverted to match `allowed_effects` deny-by-default semantics.
+- **`OllamaAdapter` refuses non-localhost `base_url` unless `OLLAMA_ALLOW_REMOTE=1` env var or `allow_remote=True` constructor arg is set.** Each remote opt-in is logged to `AuditChain` for forensic traceability.
+- `AuditProxy.audited_request` enforces an explicit `(scheme, host)` allowlist for outbound HTTP — refuses URLs outside the four documented provider hosts before `httpx.post`.
+- Every state-writing path uses atomic writes (tmp file + `fsync` + `os.replace`): keys, encrypted state, CRL, pending approvals, succession records, key pin file, archive copies, system keypair bootstrap, pricing signature, audit exports, CLI sign output, compliance report.
+- `IntegrityReceipt` canary widened from 64-bit to 128-bit truncation (16 → 32 hex characters).
+- `IntegrityReceipt` HMAC key is now a domain-separated subkey derived via SHA-256, not the raw Ed25519 signing-key bytes.
+- `AuditRecord.response_preview` is now redacted (request side already was; v1.7 closes the asymmetry on both string-level and structural-dict-walk paths). The redaction regex catches JSON-quoted `"key": "value"` shapes that the v1.6.1 regex missed.
+- `_PerSealAnomalyTracker` enforces an LRU cap of 1000 distinct `node_id` values by default. `SIGIL_PER_SEAL_TRACKER_MAX` widens.
+- Streaming response capture bounded at 256 KiB by default (`stream_capture_cap`). Larger responses still yield to the caller chunk-by-chunk; only the audit-record preview is truncated with a `[STREAM TRUNCATED AT N BYTES; TOTAL M]` marker.
+- CLI prompt-bundle reads capped at 4 MiB (`SIGIL_PROMPT_BUNDLE_MAX_BYTES`).
+- `InputNormalizer.normalize` short-circuits oversized inputs at 1 MiB before the recursive scan (`SIGIL_NORMALIZE_MAX_BYTES`).
+- `TRUST_PREAMBLE` reframed from threat-language ("severe punishment," "immutable law") to advisory framing that explicitly names the `Validator` gate as authoritative. The README claim of "structural resistance to injection" was an overclaim that the v1.7 docs walk back. Per the new framing: SIGIL mediates effects under the assumption the model may be jailbroken at the attention level. Cite: Srivastava & Panda, *Attention Is Where You Attack* (2026).
+- Telemetry exception handling narrowed: `except Exception:` only at recursion-prone sites (where re-entering `AuditChain.log` would loop). Other security-telemetry paths catch the specific exceptions (`OSError`, `RuntimeError`, `ValueError`) and surface to a module logger.
+
+### Migration from 1.6.1
+
+Six breaking changes with explicit migration paths:
+
+**1. `InputNormalizer.normalize` returns redaction markers, not decoded text.**
+
+```python
+# v1.6.1
+text, warnings = InputNormalizer.normalize(b64_payload)
+assert "ignore previous instructions" in text  # decoded into output
+
+# v1.7.0
+text, warnings = InputNormalizer.normalize(b64_payload)
+assert "ignore previous instructions" not in text  # redacted
+assert "[REDACTED-BASE64-" in text                  # marker present
+# Decoded form is in AuditChain "input_payload_redacted" entry
+```
+
+If you relied on the decoded form for downstream processing, read it from the audit chain via `AuditChain` queries on the `input_payload_redacted` event.
+
+**2. Capability-bearing seals must use the validator path.**
+
+```python
+# v1.6.1
+result = tools.execute("transfer_money", seal, amount=100)
+
+# v1.7.0 — for seals with seal.capabilities populated
+result = runtime.validate_and_execute(node_id, user_input, [proposed_invocation])
+for inv in result["validated_invocations"]:
+    tools.execute_validated(seal, ToolInvocation(**inv), **inv["parameters"])
+
+# Legacy seals (empty seal.capabilities) — no change required
+result = tools.execute("legacy_tool", seal)  # still works
+```
+
+**3. `UncertaintyGate` requires a reachable Ollama instance.**
+
+```python
+# v1.7.0 default — requires Ollama at http://localhost:11434 with
+# nomic-embed-text loaded.
+gate = UncertaintyGate(adapter, k_samples=3)
+
+# Override the embedding model or URL:
+gate = UncertaintyGate(
+    adapter,
+    embedding_url="http://localhost:11434",
+    embedding_model="bge-small-en",
+)
+
+# Tests can inject a fake client to skip Ollama:
+gate = UncertaintyGate(adapter, embedding_client=fake_client)
+```
+
+If you cannot run Ollama, `UncertaintyGate` is not currently usable — opt out at the architecture level rather than running a known-broken Jaccard implementation. The v1.6.1 behavior is gone.
+
+**4. State IDs must be 24-character hex.**
+
+```python
+# v1.6.1 — accepted any string
+HumanGate.approve("any_arbitrary_string")
+
+# v1.7.0 — must match request_approval shape
+HumanGate.approve("a1b2c3d4e5f6a1b2c3d4e5f6")  # 24 hex chars
+HumanGate.approve("../tmp/exploit")           # raises ValueError
+```
+
+If you have callers that synthesized state_ids with non-hex characters, they need to use the value `request_approval` returns.
+
+**5. `AuditChain.verify_chain` fails closed on missing system pubkey.**
+
+If your tooling depended on `verify_chain()` succeeding when `_system.pub` was missing or unreadable, the new behavior returns `(False, "Entry N has signature but system public key is missing or unreadable")`. Restore the pubkey file or regenerate it; do not interpret the False return as a tampering event without that check.
+
+**6. Empty `allowed_tools` denies, doesn't permit.**
+
+```python
+# v1.6.1 — empty list meant "all tools allowed"
+seal = SigilSeal(node_id="x", instruction="...", allowed_tools=[])
+tools.execute("any_tool", seal)  # ran
+
+# v1.7.0 — empty list denies everything
+tools.execute("any_tool", seal)  # raises PermissionError
+```
+
+Audit your existing seals: an empty `allowed_tools` was probably unintentional. If you needed "all tools," list them explicitly.
+
+### Fixed
+
+- Power-loss safety on every state-writing path (RT-2026-05-01-003 + RT-2026-05-04-001 + B-001 + B-006 sweep): keys, encrypted state, CRL, pending approvals, succession records, pin file, archive copies, system keypair bootstrap, pricing signature, audit exports, CLI sign output, compliance report.
+- DoS prevention: CLI prompt bundles capped at 4 MiB, streaming capture at 256 KiB, `InputNormalizer` input at 1 MiB, per-seal anomaly tracker memory at 1000 LRU entries.
+- `InputNormalizer` no longer over-redacts non-decoding base64/hex slices — legitimate hashes and signatures survive when an attack payload is detected nearby.
+- `EmbeddingClient.embed` writes per-call audit-chain entries (host, model, text length, SHA-256 of text — never raw text).
+- `EmbeddingClient` honors `verify_tls` / `ca_bundle` for internal-CA-signed Ollama deployments.
+- `AuditRecord.integrity_receipt_verified` is auto-populated by `AuditProxy.audited_request` when `seal` and `prompt_context` are passed (closes the v1.7 plumbing gap).
+- `AuditProxy.audited_request` honors the calling adapter's `verify_tls` / `ca_bundle` setting on the audited path (previously dropped silently).
+- Streaming request bodies redacted before audit log persistence (closes the asymmetry where the non-streaming path was already redacted).
+- Telemetry exception handling no longer swallows specific failures: narrowed catches surface the actual error to a module logger instead of silently passing.
+
+### Security
+
+- New cryptographic primitive: `IntegrityReceipt` HMAC proof-of-conditioning per request. Domain-separated subkey derivation prevents key reuse across audit-chain signing and integrity-receipt verification.
+- Path-traversal closed in `HumanGate.approve` / `check_approval`.
+- SSRF allowlist on `AuditProxy.audited_request` / `audited_stream_generator`. URLs outside the four documented provider hosts (api.anthropic.com, api.openai.com, generativelanguage.googleapis.com, localhost for Ollama) refused before `httpx.post`.
+- All outbound HTTP egress (including new `EmbeddingClient`) writes audit-chain entries.
+- `AuditChain.verify_chain` fails closed on missing/unreadable system pubkey.
+- Tool allowlist deny-by-default (empty `allowed_tools` denies all).
+- `OllamaAdapter` refuses non-localhost `base_url` unless explicitly opted in.
+- Streaming + non-streaming request and response previews are now both redacted, including JSON-quoted forms.
+- `TRUST_PREAMBLE` overclaim removed: no more "severe punishment" framing; the Validator is named explicitly as the authoritative gate.
+
+### Internal
+
+- 40 commits in range. 26 red-team findings closed. Test count 310 → 411 (+101 regression tests). One test-fixture cleanup (`3ba3981`) tightened the per-seal isolation assertion to `TOKEN_COUNT_OUTLIER_FOR_SEAL` after `time.perf_counter()` variance turned out to fire `LATENCY_MS_OUTLIER_FOR_SEAL` in CI; latency-noise threshold tracked in `.red_team/followups.md`. Three full red-team audit + remediation cycles: RT-2026-05-01 (10 findings closed), RT-2026-05-04 (8 findings closed), RT-2026-05-04B (8 findings closed, 2 info-deferred).
+
 ## [1.6.1] - 2026-04-28
 
 > **Note on versioning.** The previous version on the GitHub remote is `v1.6.0`. Local working-tree development continued from `v1.5.0`, and the changes documented in the [1.5.0] entry below are included in `v1.6.1` as well. The `v1.6.0` release on GitHub does not have a corresponding entry in this CHANGELOG yet — its release notes live on the GitHub Releases page and will be reconciled into this file when the local working tree is fetched against the remote.
@@ -289,7 +441,8 @@ SIGIL follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (0.X.0): New features, backward compatible
 - **PATCH** (0.0.X): Bug fixes, backward compatible
 
-[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/mr-gl00m/sigil/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/mr-gl00m/sigil/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/mr-gl00m/sigil/releases/tag/v1.6.0
 [1.5.0]: https://github.com/mr-gl00m/sigil/compare/v1.4.0...v1.5.0

@@ -2,6 +2,9 @@
 
 import json
 import hashlib
+import os
+
+import pytest
 
 import nacl.signing
 import nacl.encoding
@@ -222,3 +225,73 @@ def test_verify_chain_streams_large_file():
     valid, msg = AuditChain.verify_chain()
     assert valid is True
     assert "120 entries" in msg
+
+
+# --- RT-2026-05-01-002: fail-closed when system pubkey is missing ---
+
+
+def test_verify_chain_fails_when_system_pubkey_deleted():
+    """RT-2026-05-01-002: signed entries with a missing system pubkey must fail closed.
+
+    Attack: a local attacker rewrites .sigil/audit/chain.jsonl and removes
+    _system.pub so signature checks cannot run. verify_chain() must NOT report
+    valid in that case; that breaks the tamper-evidence claim.
+    """
+    AuditChain.log("a", {"x": 1})
+    AuditChain.log("b", {"x": 2})
+
+    pub_path = sigil.KEYS_DIR / "_system.pub"
+    assert pub_path.exists()
+    pub_path.unlink()
+
+    valid, msg = AuditChain.verify_chain()
+    assert valid is False
+    assert "system" in msg.lower() or "public key" in msg.lower() or "pubkey" in msg.lower()
+
+
+def test_verify_chain_fails_when_system_pubkey_corrupt():
+    """RT-2026-05-01-002: an unreadable system pubkey must fail closed too."""
+    AuditChain.log("a", {"x": 1})
+
+    pub_path = sigil.KEYS_DIR / "_system.pub"
+    pub_path.write_bytes(b"not-a-real-key")
+
+    valid, msg = AuditChain.verify_chain()
+    assert valid is False
+
+
+# --- RT-2026-05-01-003: atomic writes do not leave temp files in place ---
+
+
+def test_atomic_write_leaves_no_tmp_files(sigil_isolation):
+    """_atomic_write_bytes/_text must not leave .tmp.* siblings after success."""
+    target = sigil_isolation["sigil_dir"] / "atomic_target.json"
+    sigil._atomic_write_text(target, '{"k": 1}')
+    sigil._atomic_write_text(target, '{"k": 2}')
+    sigil._atomic_write_bytes(target, b'{"k": 3}')
+
+    leftovers = [
+        p for p in target.parent.iterdir()
+        if p.is_file() and p.name.startswith(f".{target.name}.tmp")
+    ]
+    assert leftovers == [], f"tmp files leaked: {leftovers}"
+    assert target.read_bytes() == b'{"k": 3}'
+
+
+def test_atomic_write_cleans_tmp_on_failure(sigil_isolation, monkeypatch):
+    """RT-2026-05-01-003: a failed os.replace must not leave a tmp file behind."""
+    target = sigil_isolation["sigil_dir"] / "atomic_fail.json"
+
+    real_replace = os.replace
+
+    def boom(src, dst):
+        raise OSError("simulated power loss before replace")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="simulated"):
+        sigil._atomic_write_text(target, "this should not land")
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    assert not target.exists()
+    leftovers = [p for p in target.parent.iterdir() if p.name.startswith(f".{target.name}.tmp")]
+    assert leftovers == [], f"tmp files leaked: {leftovers}"

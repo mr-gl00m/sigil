@@ -1,75 +1,77 @@
-# SIGIL v1.6.1 — License migration, project hygiene, documentation honesty
+# SIGIL 1.7.0
 
-A maintenance release that fixes three credibility-bleeding gaps in SIGIL's documentation and adds the project hygiene that makes the repo look like a real open-source library instead of a one-off. No security-behavior changes; the test suite (310 passed, 2 skipped) is unchanged.
+Cryptographic proof-of-conditioning per request, embedding-based uncertainty checks, and 26 red-team findings closed across three remediation rounds.
 
-> **Note on versioning.** The previous tagged release on the GitHub remote is `v1.6.0`. This release skips a separate `v1.6.0` entry in the local CHANGELOG because local working-tree development continued from `v1.5.0`, and the `v1.6.0` notes live on the GitHub Releases page. `v1.6.1` is being shipped as the patch on top of `v1.6.0`. The `v1.5.0` code changes (encrypted state at rest, embedded encoding detection, file-lock coverage on state writes, bounded audit queue, sensitive-file permissions) are also included in this distribution; they were never separately tagged in local git history.
+## Highlights
 
----
+- **`IntegrityReceipt` — HMAC proof-of-conditioning per request.** SIGIL embeds an HMAC canary in the prompt context that the model is asked to echo. The canary is derived from a domain-separated subkey of the system signing key plus a per-request nonce and the seal hash. SIGIL recomputes the HMAC and verifies the response carried a valid receipt. A model that bypassed `IRONCLAD_CONTEXT` cannot fabricate a matching canary because it doesn't hold the key. Closest thing to a soundness check on whether the model actually conditioned on the seal in this specific request.
+- **Embedding-based `UncertaintyGate` replaces Jaccard.** The old similarity metric passed "Yes, transfer the funds" and "No, don't transfer the funds" as consistent because they share most stop-word-stripped tokens. Cosine on Ollama embeddings (`nomic-embed-text` by default) catches the semantic flip. Hard dep on a reachable Ollama instance; fails closed on `EmbeddingError`.
+- **26 red-team findings closed.** Three rounds: RT-2026-05-01 (10 findings), RT-2026-05-04 (8 findings), RT-2026-05-04B (8 findings + 2 info-deferred). Hardening across atomic-write coverage, SSRF allowlists, secret redaction in audit logs, key separation in the HMAC-receipt path, deny-by-default tool allowlists, and path-traversal prevention.
 
-## License: CC0 → MIT
+## What's changed
 
-The repo previously carried a CC0 1.0 `LICENSE` file but described itself as MIT in every pitch document. That contradiction is fixed: SIGIL is now MIT licensed, with the MIT text propagated across `LICENSE`, README badge and footer, `CONTRIBUTING.md`, source-file headers in `sigil.py` / `sigil_audit_proxy.py` / `sigil_llm_adapter.py`, the demo banner, and historical release-notes footers.
+### Added
 
-The README's old "no attribution required, fork it sell it" line was CC0 phrasing and incorrect for MIT. Replaced with: **use it commercially or personally, modify it, ship it — the only requirement is that the copyright notice and license text travel with derivative works.**
+- `IntegrityReceipt` — HMAC-based proof-of-conditioning per request. `embed(seal)` and `verify(seal, context, response)` for callers; `AuditProxy.audited_request` auto-verifies and populates `AuditRecord.integrity_receipt_verified`.
+- `EmbeddingClient` — Ollama embeddings client backing the new `UncertaintyGate`. Honors `OLLAMA_ALLOW_REMOTE`, `verify_tls`, `ca_bundle`. Per-call audit-chain entries.
+- `_PerSealAnomalyTracker` — rolling-window statistical anomaly detection per `SigilSeal.node_id`. Fires `*_OUTLIER_FOR_SEAL` reasons when a record is ≥3σ off the seal's own baseline. LRU cap 1000, env override `SIGIL_PER_SEAL_TRACKER_MAX`.
+- `ToolRegistry.execute_validated(seal, invocation)` — supported dispatch path for capability-bearing seals. Re-verifies `seal.capabilities[capability_id]` matches `invocation.resolved_tool` before running.
+- `requirements-lock.txt` for reproducible installs.
+- Operator knobs: `OLLAMA_ALLOW_REMOTE`, `SIGIL_PROMPT_BUNDLE_MAX_BYTES`, `SIGIL_NORMALIZE_MAX_BYTES`, `SIGIL_PER_SEAL_TRACKER_MAX`, `OLLAMA_TIMEOUT_SECONDS`. New kwargs: `verify_tls` / `ca_bundle` on `EmbeddingClient` and `OllamaAdapter`, `verify` / `node_id` / `seal` / `prompt_context` on `AuditProxy.audited_request`, `stream_capture_cap` on `AuditProxy`.
 
-Existing CC0 grants for code published under prior tags remain valid for what was distributed at the time. Going forward, every release is MIT.
+### Changed (breaking)
 
-## Project hygiene
+Six breaking changes within the 1.x series. All have explicit migration paths in the migration section below.
 
-- **`SECURITY.md`** — responsible-disclosure process, contact email, response-time targets (72h ack, 14-day fix for confirmed CRITICAL/HIGH, 90-day coordinated disclosure window), explicit safe-harbor language for good-faith research.
-- **`pyproject.toml`** — PEP 621 metadata. After the first PyPI upload, `pip install sigil-security[all]` will pull SIGIL plus the optional LLM and token-counting dependencies. Optional dependency groups: `[llm]` for `httpx` + `python-dotenv`, `[tokens]` for `tiktoken`, `[all]` for both, `[dev]` for the test suite.
-- **GitHub Actions CI** at `.github/workflows/ci.yml` — runs pytest on Python 3.10 / 3.11 / 3.12 across Ubuntu and Windows, plus a `python -m build` + `twine check` pass on every push and pull request. The README now carries a CI status badge.
-- **`_cli_entry()`** added to `sigil.py` so the `sigil` console script registered in `pyproject.toml` reproduces the existing `__main__` dispatch (no-args → demo, args → CLI).
-- **Project website** — single-page HTML at `docs/index.html`, no JavaScript, no external dependencies, dark theme. Deploys via GitHub Pages from `main` / `/docs`. `docs/.nojekyll` keeps the custom HTML untouched.
+- `InputNormalizer.normalize` now redacts encoded payloads instead of decoding them into the prompt. Redaction markers like `[REDACTED-BASE64-{hash}]` replace the encoded slice; the original + decoded form are logged to AuditChain. The model never sees the decoded payload.
+- `ToolRegistry.execute(tool_name, seal)` refuses capability-bearing seals. Use the validator path (`SigilRuntime.validate_and_execute` → `ToolRegistry.execute_validated`).
+- `UncertaintyGate` similarity metric switched from Jaccard to embedding cosine. Default threshold 0.6 → 0.7. Requires Ollama unless an `embedding_client=` is injected.
+- `HumanGate.approve` / `check_approval` reject `state_id` values that don't match `^[a-f0-9]{24}$`. Closes a path-traversal vector.
+- `AuditChain.verify_chain` fails closed when signed entries exist but the system pubkey is missing or unreadable.
+- Empty `SigilSeal.allowed_tools` now denies all tools instead of permitting all (matches `allowed_effects` deny-by-default semantics).
 
-## Documentation honesty
+### Changed (non-breaking)
 
-The pitch documents (`paper-sigil_2026-04-17/00_SIGIL_Pitch.md`, `01_SIGIL_Overview.md`, `02_SIGIL_Whitepaper.md`) previously claimed *"five rounds of independent security review"* and *"two independent red team assessments."* Reframed every instance as **"structured red-team review, self-conducted by the author using adversarial prompting against frontier LLMs (Claude, GPT-4, Gemini)."** The 88-findings figure stands; the implication of external auditing did not match reality. If you intend to be the first external auditor, see [`SECURITY.md`](https://github.com/mr-gl00m/sigil/blob/main/SECURITY.md).
+- `OllamaAdapter` refuses non-localhost `base_url` unless `OLLAMA_ALLOW_REMOTE=1` or `allow_remote=True`. Each opt-in is logged to AuditChain.
+- `AuditProxy.audited_request` enforces an explicit `(scheme, host)` allowlist before `httpx.post`.
+- Every state-writing path uses atomic writes (tmp + fsync + rename): keys, encrypted state, CRL, pending approvals, succession records, pin file, archive copies, system keypair bootstrap, pricing signature, audit exports, CLI sign output, compliance report.
+- `IntegrityReceipt` canary widened to 128 bits; HMAC key now a domain-separated SHA-256 subkey of the signing key (not the raw bytes).
+- `AuditRecord.response_preview` is now redacted, including JSON-quoted `"key": "value"` forms.
+- Streaming response capture bounded at 256 KiB; CLI prompt-bundle reads at 4 MiB; `InputNormalizer` input at 1 MiB.
+- `TRUST_PREAMBLE` reframed from threat-language to advisory; Validator named explicitly as the authoritative gate.
 
-Every reference to the April 7, 2026 Anthropic *Claude Mythos Preview* announcement now links to the [official Anthropic post](https://red.anthropic.com/2026/mythos-preview/) so readers can verify the claim in one click.
+### Fixed
 
-For the full first-person write-up of the credibility-fix process — what the gaps were, how they were found, why they mattered — see [`BLOG_2026-04-28_credibility_fixes.md`](https://github.com/mr-gl00m/sigil/blob/main/BLOG_2026-04-28_credibility_fixes.md).
+- Power-loss safety on every state-writing path.
+- DoS prevention via input-size caps on every external boundary.
+- `InputNormalizer` no longer over-redacts non-decoding base64/hex slices — legitimate hashes survive.
+- `EmbeddingClient` honors operator TLS settings; writes audit-chain entries on every embed call.
+- `AuditRecord.integrity_receipt_verified` auto-populated when `seal` + `prompt_context` are passed.
+- `AuditProxy.audited_request` honors the calling adapter's `verify_tls` / `ca_bundle` choice.
+- Streaming request bodies redacted before audit log persistence.
+- Telemetry exception handling no longer swallows specific failures.
 
-## Install
+### Security
 
-```bash
-# Once published to PyPI:
-pip install sigil-security[all]
+- New `IntegrityReceipt` HMAC primitive (see Highlights).
+- Path-traversal closed in `HumanGate`.
+- SSRF allowlist on `AuditProxy` outbound HTTP.
+- All outbound HTTP egress writes audit-chain entries.
+- `AuditChain.verify_chain` fails closed on missing pubkey.
+- Tool allowlist deny-by-default.
+- `OllamaAdapter` localhost-only by default.
+- Streaming + non-streaming request and response previews both redacted.
+- `TRUST_PREAMBLE` overclaim removed.
 
-# From source (today):
-git clone https://github.com/mr-gl00m/sigil.git
-cd sigil
-git checkout v1.6.1
-pip install -e ".[dev]"
-python -m pytest tests/ -q   # 310 passed, 2 skipped
-python sigil.py demo
-```
+## Migration from v1.6.1
 
-## What didn't change
+Six breaking changes; full before/after examples in `CHANGELOG.md` under the `Migration from 1.6.1` section. The short list:
 
-- **No security-behavior changes.** The cryptographic guarantees, the validator gate, the audit chain, the input normalizer, and the human-in-the-loop sign-off all behave identically to v1.6.0. Encrypted state files, capability-ID resolution, effect-class enforcement — all the prior hardening is preserved.
-- **No API surface changes.** Existing `Architect.seal()`, `SigilRuntime.execute()`, `ContextArchitect.build_context()`, `HumanGate.request_approval()`, and the `@vow` decorator continue to work exactly as before.
-- **No new external dependencies.** Required deps remain `pynacl`. Optional deps remain `httpx`, `python-dotenv`, `tiktoken`.
+1. **`InputNormalizer.normalize` returns redaction markers, not decoded text.** Read decoded forms from the audit chain (`input_payload_redacted` events) if you need them.
+2. **Capability-bearing seals require the validator path.** `ToolRegistry.execute(tool_name, seal)` raises `PermissionError` when `seal.capabilities` is non-empty. Use `SigilRuntime.validate_and_execute` and `ToolRegistry.execute_validated`.
+3. **`UncertaintyGate` requires Ollama** with an embedding model loaded (default `nomic-embed-text`). No silent fallback.
+4. **State IDs must be 24-character hex.** Use what `request_approval` returns; arbitrary strings raise `ValueError`.
+5. **`AuditChain.verify_chain` fails closed on missing system pubkey.** Restore `_system.pub` or regenerate; don't read the False return as a tampering event without that check.
+6. **Empty `allowed_tools` denies, doesn't permit.** Audit existing seals — an empty list was probably unintentional. List allowed tools explicitly.
 
-## Tag history
-
-- `v1.6.1` — this release (license + hygiene + documentation honesty)
-- `v1.6.0` — prior release, GitHub-only (notes on the Releases page)
-- `v1.4.0` — Deterministic Validator Gate (tagged retroactively on 2026-04-28; commit dates from 2026-04-01)
-- `v1.3.0` — Complete Red Team Remediation
-- `v1.1.0` — Initial security remediation (53 findings)
-
-`v1.5.0` and `v1.2.0` are not tagged in git history because the corresponding work never had clean isolated commit boundaries. Their changes are included in v1.6.1 and v1.3.0 respectively. See [`CHANGELOG.md`](https://github.com/mr-gl00m/sigil/blob/main/CHANGELOG.md) for full per-version remediation history.
-
-## Links
-
-- [README](https://github.com/mr-gl00m/sigil/blob/main/README.md)
-- [Credibility-fix blog post](https://github.com/mr-gl00m/sigil/blob/main/BLOG_2026-04-28_credibility_fixes.md) — first-person write-up of why this release exists
-- [Whitepaper — On the Necessity of a Structural Security Layer for Agentic AI Systems](https://github.com/mr-gl00m/sigil/blob/main/paper-sigil_2026-04-17/02_SIGIL_Whitepaper.md)
-- [Overview — Security for AI Systems That Actually Do Things](https://github.com/mr-gl00m/sigil/blob/main/paper-sigil_2026-04-17/01_SIGIL_Overview.md)
-- [Security Policy](https://github.com/mr-gl00m/sigil/blob/main/SECURITY.md)
-- [Project Website](https://mr-gl00m.github.io/sigil/) (active once GitHub Pages is enabled)
-
----
-
-*SIGIL is built and maintained by [Cid (mr-gl00m)](https://github.com/mr-gl00m). Independent developer, security researcher, MIT licensed.*
+**Full changelog:** https://github.com/mr-gl00m/sigil/compare/v1.6.1...v1.7.0
