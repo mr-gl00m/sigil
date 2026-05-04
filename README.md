@@ -344,6 +344,6 @@ If you find this useful, consider supporting development:
 
 ## License
 
-**[MIT License](LICENSE)**
+[MIT](./LICENSE). Copyright © 2026 Nathan Seals / Nexus Labs
 
 MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
