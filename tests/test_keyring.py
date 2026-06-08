@@ -285,3 +285,41 @@ def test_audit_chain_system_keypair_bootstrap_uses_atomic_writes(sigil_isolation
     assert any("_system.pub" in t for t in replace_targets), (
         f"_system.pub bootstrap did not use os.replace. Targets: {replace_targets}"
     )
+
+
+# --- RT-2026-05-29-007: keygen --force archives + confirms ---
+
+
+def test_keygen_force_archives_and_confirms(sigil_isolation, monkeypatch):
+    """RT-2026-05-29-007: `keygen <name> --force` on an existing key archives
+    the previous keypair and requires a typed confirmation before overwriting
+    the trust root."""
+    import sys
+    Keyring.generate("architect")
+    original_key = (sigil.KEYS_DIR / "architect.key").read_bytes()
+
+    monkeypatch.setattr(sys, "argv", ["sigil.py", "keygen", "architect", "--force"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "architect")
+    sigil.cli()
+
+    backups = list(sigil.KEYS_DIR.glob("architect.key.bak.*"))
+    assert backups, "no archive of the previous key was created"
+    assert backups[0].read_bytes() == original_key
+    assert (sigil.KEYS_DIR / "architect.key").read_bytes() != original_key
+
+
+def test_keygen_force_aborts_on_mismatched_confirmation(sigil_isolation, monkeypatch):
+    """RT-2026-05-29-007: a confirmation that does not match the key name
+    leaves the existing key untouched and creates no archive."""
+    import sys
+    Keyring.generate("architect")
+    original_key = (sigil.KEYS_DIR / "architect.key").read_bytes()
+
+    monkeypatch.setattr(sys, "argv", ["sigil.py", "keygen", "architect", "--force"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "wrong-name")
+    sigil.cli()
+
+    assert (sigil.KEYS_DIR / "architect.key").read_bytes() == original_key, (
+        "key was overwritten despite a mismatched confirmation"
+    )
+    assert not list(sigil.KEYS_DIR.glob("architect.key.bak.*"))

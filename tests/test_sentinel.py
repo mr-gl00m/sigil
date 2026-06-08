@@ -96,6 +96,30 @@ def test_crl_file_missing_ok(sentinel):
     assert sentinel.revoked_hashes == set() or len(sentinel.revoked_hashes) == 0
 
 
+def test_corrupt_crl_fails_closed_without_crashing(architect):
+    """RT-2026-05-29-004: an unparseable revoked.json must not propagate a raw
+    JSONDecodeError out of Sentinel construction, and must NOT be read as
+    'nothing revoked' (fail-open). verify() fails closed instead."""
+    sigil.CRL_FILE.write_text("{ this is not valid json ]]]")
+    sentinel = Sentinel("architect")  # must not raise
+    assert sentinel._crl_unreadable is True
+    seal = architect.seal(node_id="n1", instruction="be safe")
+    valid, msg = sentinel.verify(seal)
+    assert valid is False
+    assert "INVALID" in msg
+
+
+def test_non_list_crl_fails_closed(architect):
+    """RT-2026-05-29-004: a CRL that parses to a non-array (e.g. an object)
+    is rejected like unparseable JSON — fail closed, no crash."""
+    sigil.CRL_FILE.write_text(json.dumps({"unexpected": "object"}))
+    sentinel = Sentinel("architect")
+    assert sentinel._crl_unreadable is True
+    seal = architect.seal(node_id="n2", instruction="be safe")
+    valid, msg = sentinel.verify(seal)
+    assert valid is False
+
+
 def test_crl_cache_ttl(architect, sentinel):
     """CRL cache respects TTL - within 5s, cached version is used."""
     seal = architect.seal(node_id="n1", instruction="test")

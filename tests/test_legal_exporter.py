@@ -97,6 +97,47 @@ def test_zip_contains_chain_of_custody(audit_proxy, tmp_path):
         assert "TEST-004" in content
 
 
+def test_discovery_package_reredacts_leaked_preview(audit_proxy, tmp_path):
+    """RT-2026-05-29-001: records captured under older redaction logic may
+    carry a secret in their preview fields. The discovery bundle is the
+    highest-consequence sink (handed to a court/regulator), so it re-redacts
+    record previews before writing records.json instead of trusting that
+    capture-time redaction was complete."""
+    record = AuditRecord(
+        request_id="leak_0",
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        provider="anthropic",
+        model="claude",
+        latency_ms=100.0,
+        time_to_first_byte_ms=None,
+        input_tokens=10,
+        output_tokens=20,
+        total_tokens=30,
+        estimated_cost_usd=0.001,
+        request_hash="h",
+        response_fingerprint="f",
+        status_code=200,
+        success=True,
+        response_preview="Authorization: Bearer sk-HISTORICAL-LEAK-987654321",
+    )
+    audit_proxy._store_record(record)
+    start = datetime.now(timezone.utc) - timedelta(hours=1)
+    end = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    zip_path = LegalExporter.create_discovery_package(
+        time_range=(start, end),
+        case_id="LEAK-001",
+        proxy=audit_proxy,
+        output_dir=tmp_path,
+    )
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        records_json = zf.read("records.json").decode()
+    assert "sk-HISTORICAL-LEAK-987654321" not in records_json, (
+        "discovery bundle leaked a secret from a record preview"
+    )
+    assert "[REDACTED]" in records_json
+
+
 def test_hash_file(tmp_path):
     """_hash_file returns consistent SHA256."""
     import hashlib

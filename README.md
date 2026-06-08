@@ -5,12 +5,8 @@
 
 > SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
 
-<p align="center">
-  <img src="sigil_logo.png" alt="SIGIL" width="200"/>
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![CI](https://github.com/mr-gl00m/sigil/actions/workflows/ci.yml/badge.svg)](https://github.com/mr-gl00m/sigil/actions/workflows/ci.yml)
 
 ---
 
@@ -144,7 +140,6 @@ response = adapter.complete(context)
 | Anthropic Claude | `ClaudeAdapter` | claude-sonnet-4-20250514 | Pass `model=` to override |
 | OpenAI GPT | `OpenAIAdapter` | gpt-4-turbo-preview | Pass `model=` to override |
 | Local (Ollama) | `OllamaAdapter` | llama2 | llama3.2, mistral, phi, etc. |
-| DeepSeek | `---` | --- | Coming Soon |
 
 #### Audit Proxy signals
 
@@ -277,15 +272,13 @@ SIGIL makes deliberate trade-offs. Understand them before deploying.
 
 ### Deployment shape
 
-- **Single-host design.** SIGIL relies on the local filesystem (`.sigil/`) and `fcntl`/`msvcrt` file locks for the audit chain, nonce store, and HumanGate approvals. This is correct for single-host deployments and breaks at horizontal scale. Running 50 containers against a shared network drive is not supported. A pluggable state backend (DB-backed chain, Redis for nonces/locks) is the right enterprise path — see [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the design sketch.
+- **Single-host design.** SIGIL relies on the local filesystem (`.sigil/`) and `fcntl`/`msvcrt` file locks for the audit chain, nonce store, and HumanGate approvals. This is correct for single-host deployments and breaks at horizontal scale. Running 50 containers against a shared network drive is not supported. A pluggable state backend (DB-backed chain, Redis for nonces/locks) is the right enterprise path.
 - **System signing key is stored unencrypted on disk** (`0o600` at `.sigil/keys/_system.key`). An attacker with RCE or LFI on the host can read it and forge audit entries. For production, the `_get_system_signer()` chokepoint is designed to be swapped for an HSM / AWS KMS / Vault adapter. Not shipped yet.
 - **File locks are best-effort on some platforms.** While SIGIL defaults to strict (fail-closed) locking, edge cases in network filesystems may still permit races.
 
 ### Performance
 
 - **UncertaintyGate costs 3x tokens and 3x latency.** Self-consistency voting requires `k_samples=3` by default. Samples are currently generated sequentially. Use it for high-stakes calls only; don't wrap every LLM request in it.
-
-See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for remediation paths and design notes for each item.
 
 ---
 
@@ -328,11 +321,11 @@ SIGIL proves that a high-integrity, sovereign security layer is not only possibl
 
 ---
 
-## License
-[MIT](./LICENSE). Copyright © 2026 Nathan Seals / Nexus Labs. Use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
-
 ## Support
-SIGIL is free and MIT licensed. If you find this useful, consider supporting development:
+
+SIGIL is free and MIT licensed.
+
+If you find this useful, consider supporting development:
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/cidthedev)
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sponsors/cidthedev)
@@ -341,3 +334,11 @@ SIGIL is free and MIT licensed. If you find this useful, consider supporting dev
 - BTC: `bc1qtpc2xqkc9d3lmd0tkp39skprzja2c4q74248u8`
 - ETH: `0xcd27154aE006c77948d70DAf9Cedf84B06Aa4f54`
 - SOL: `75JW7Ay36jgVjDSkQnWa8zTSwQqsHj6sVS6o4WBUC6T7`
+
+---
+
+## License
+
+**[MIT License](LICENSE)**
+
+MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.

@@ -682,21 +682,39 @@ class AuditProxy:
         r'(?i)\b(api[_-]?key|secret|token|password|authorization)\b'
     )
 
+    # RT-2026-05-29-001: key-anchored redaction alone misses unlabeled provider
+    # tokens that appear inline in prose (a model explaining an API, or a tool
+    # result echoing one). Match the well-known credential prefixes directly.
+    _BARE_TOKEN_RE = re.compile(
+        r'sk-[A-Za-z0-9_-]{16,}'        # OpenAI / Anthropic (sk-, sk-proj-, sk-ant-)
+        r'|gh[pousr]_[A-Za-z0-9]{16,}'  # GitHub PAT family
+        r'|AIza[A-Za-z0-9_-]{16,}'      # Google API key
+    )
+
+    # RT-2026-05-29-001: the credential value can be a quoted string, or an
+    # unquoted run that includes spaces ("Bearer <token>"). Match a quoted
+    # value whole, otherwise consume up to the next structural delimiter
+    # (comma, semicolon, ampersand) or end of line — never stop at the first
+    # space, which left the real token after "Bearer" in the clear.
+    _SENSITIVE_KV_RE = re.compile(
+        r'(?i)["\']?(api[_-]?key|secret|token|password|authorization)["\']?'
+        r'\s*([=:])\s*'
+        r'("[^"\r\n]*"|\'[^\'\r\n]*\'|[^\r\n,;&]+)'
+    )
+
     def _redact_body(self, body_str: str) -> str:
         """Scrub sensitive key/value patterns from a body string (H-03).
 
         Handles plain-text ``key=value`` and ``key: value`` shapes plus the
         JSON-quoted ``"key": "value"`` form models commonly produce when
-        echoing structured config (RT-2026-05-04B-007). The optional
-        ``["']?`` segments allow either side of the key/value to carry
-        single or double quotes without breaking the match.
+        echoing structured config (RT-2026-05-04B-007). The value side is
+        matched as a quoted string or an unquoted run up to the next
+        structural delimiter, so multi-token values like ``Bearer <token>``
+        are redacted whole (RT-2026-05-29-001). Unlabeled provider tokens in
+        free prose are caught by a second prefix-based pass.
         """
-        result = re.sub(
-            r'(?i)["\']?(api[_-]?key|secret|token|password|authorization)["\']?'
-            r'\s*([=:])\s*["\']?\S+',
-            r'\1\2 [REDACTED]',
-            body_str,
-        )
+        result = self._SENSITIVE_KV_RE.sub(r'\1\2 [REDACTED]', body_str)
+        result = self._BARE_TOKEN_RE.sub("[REDACTED]", result)
         for pattern in self._custom_redact_patterns:
             result = pattern.sub("[REDACTED]", result)
         return result
@@ -1607,6 +1625,19 @@ class LegalExporter:
             if start <= ts <= end:
                 windowed.append(rec)
 
+        # RT-2026-05-29-001: re-redact preview fields at the export boundary.
+        # _records is reloaded from disk at startup, so records captured under
+        # older redaction logic can still carry a secret. The discovery bundle
+        # is the highest-consequence sink (handed to a court/regulator), so it
+        # does not trust that capture-time redaction was complete. Redact on
+        # copies — never mutate the live in-memory records.
+        redacted_records = []
+        for r in windowed:
+            d = asdict(r)
+            d["request_preview"] = proxy._redact_body(d.get("request_preview") or "")
+            d["response_preview"] = proxy._redact_body(d.get("response_preview") or "")
+            redacted_records.append(d)
+
         export_json = {
             "case_id": case_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1615,7 +1646,7 @@ class LegalExporter:
                 "end": end.isoformat(),
             },
             "record_count": len(windowed),
-            "records": [asdict(r) for r in windowed],
+            "records": redacted_records,
         }
         records_path = bundle_dir / "records.json"
         _atomic_write_text(records_path, json.dumps(export_json, indent=2))

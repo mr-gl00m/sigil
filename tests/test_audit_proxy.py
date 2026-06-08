@@ -543,6 +543,36 @@ def test_audited_request_response_preview_redacts_secrets(audit_proxy, monkeypat
     assert "[REDACTED]" in record.response_preview
 
 
+# --- RT-2026-05-29-001: redaction must cover space-separated and unlabeled values ---
+
+
+def test_redact_body_bearer_token_full_value(audit_proxy):
+    """RT-2026-05-29-001: the value matcher must consume the entire credential
+    value, not just the first whitespace-delimited token. The old '\\S+' stopped
+    at the space after 'Bearer', redacting only the scheme word and leaving the
+    real token in the clear, which then persisted into audit_records.jsonl and
+    any LegalExporter discovery bundle."""
+    leaked = audit_proxy._redact_body("Authorization: Bearer sk-REALSECRET-leak-me-12345")
+    assert "sk-REALSECRET-leak-me-12345" not in leaked, (
+        f"_redact_body leaked the bearer token: {leaked!r}"
+    )
+    assert "[REDACTED]" in leaked
+
+
+def test_redact_body_bare_provider_token(audit_proxy):
+    """RT-2026-05-29-001: an unlabeled provider token in free prose (no
+    'key:' prefix) must still be redacted. Models emit these inline and tool
+    results surface them, so key-anchored redaction alone is insufficient."""
+    for secret in (
+        "sk-proj-ABCDEF0123456789ghijklmnop",
+        "ghp_ABCDEF0123456789ghijklmnopqrstuvwx",
+        "AIzaSyABCDEF0123456789ghijklmnopqrst",
+    ):
+        out = audit_proxy._redact_body(f"Your new credential is {secret} and it is now live.")
+        assert secret not in out, f"_redact_body leaked a bare token: {out!r}"
+        assert "[REDACTED]" in out
+
+
 # --- v1.7: per-seal anomaly baselines ---
 
 

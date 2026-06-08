@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigil-security"
-version = "1.7.0"
+version = "1.8.0"
 description = "Sovereign Integrity & Governance Interface Layer — open-source cryptographic prompt security for agentic LLM systems."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -35,28 +35,32 @@ classifiers = [
     "Topic :: Security :: Cryptography",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# RT-2026-05-29-006: upper bounds cap the next major so a `pip install
+# sigil-security` that skips requirements-lock.txt cannot silently pull a
+# breaking (or compromised) major into the crypto path. The lockfile remains
+# the reproducible-install source of truth; these ranges keep the library usable.
 dependencies = [
-    "pynacl>=1.5",
+    "pynacl>=1.5,<2",
 ]
 
 [project.optional-dependencies]
 llm = [
-    "httpx>=0.25",
-    "python-dotenv>=1.0",
+    "httpx>=0.25,<1",
+    "python-dotenv>=1.0,<2",
 ]
 tokens = [
-    "tiktoken>=0.7",
+    "tiktoken>=0.7,<1",
 ]
 all = [
-    "httpx>=0.25",
-    "python-dotenv>=1.0",
-    "tiktoken>=0.7",
+    "httpx>=0.25,<1",
+    "python-dotenv>=1.0,<2",
+    "tiktoken>=0.7,<1",
 ]
 dev = [
-    "pytest>=7.0",
-    "httpx>=0.25",
-    "python-dotenv>=1.0",
-    "tiktoken>=0.7",
+    "pytest>=7.0,<10",
+    "httpx>=0.25,<1",
+    "python-dotenv>=1.0,<2",
+    "tiktoken>=0.7,<1",
 ]
 
 [project.scripts]

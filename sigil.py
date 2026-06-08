@@ -1092,6 +1092,10 @@ class Sentinel:
         self.expected_key_id = Keyring.get_key_id(key_name)
         self._crl_cache_timestamp: float = 0.0
         self._succession_cache: Optional[list] = None
+        # RT-2026-05-29-004: set when revoked.json can't be parsed, so verify()
+        # fails closed (rejects every seal) rather than crashing or silently
+        # treating a corrupt CRL as "nothing revoked".
+        self._crl_unreadable: bool = False
         self._load_crl()
 
     def _load_crl(self, force: bool = False):
@@ -1111,9 +1115,34 @@ class Sentinel:
             return  # Cache is fresh, skip reload
 
         self.revoked_hashes: Set[str] = set()
+        self._crl_unreadable = False
         if CRL_FILE.exists():
             with FileLock(CRL_FILE, strict=False):
-                crl = json.loads(CRL_FILE.read_text())
+                raw_crl = CRL_FILE.read_text()
+            # RT-2026-05-29-004: a corrupt revoked.json must not propagate a raw
+            # JSONDecodeError out of Sentinel.__init__ / execute(), and must NOT
+            # be read as an empty list — that would silently un-revoke every
+            # seal (fail-open). Flag it and fail closed in verify() instead.
+            try:
+                crl = json.loads(raw_crl)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._crl_unreadable = True
+                try:
+                    AuditChain.log("crl_parse_error", {"error": str(exc)})
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                self._crl_cache_timestamp = current_time
+                return
+            if not isinstance(crl, list):
+                self._crl_unreadable = True
+                try:
+                    AuditChain.log("crl_parse_error", {
+                        "error": f"CRL is not a JSON array: {type(crl).__name__}"
+                    })
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                self._crl_cache_timestamp = current_time
+                return
             unsigned_legacy = 0
             structurally_invalid = 0
             wrong_signer = 0
@@ -1218,6 +1247,11 @@ class Sentinel:
         # Refresh CRL cache if requested (for execution-time checks)
         if refresh_crl:
             self._load_crl()
+
+        # RT-2026-05-29-004: if the CRL couldn't be parsed we cannot certify
+        # revocation status — fail closed rather than letting a seal through.
+        if self._crl_unreadable:
+            failures.append("CRL_UNREADABLE: Revocation list corrupt; cannot certify revocation status")
 
         content_hash = seal.content_hash()
         if content_hash in self.revoked_hashes:
@@ -2668,6 +2702,34 @@ Examples:
 
     if args.command == "keygen":
         try:
+            # RT-2026-05-29-007: --force overwrites the signing key in place.
+            # Regenerating an existing key invalidates EVERY seal it ever signed
+            # (they verify as UNTRUSTED). Archive the old keypair and require an
+            # explicit typed confirmation before destroying the trust root.
+            key_path = KEYS_DIR / f"{args.name}.key"
+            pub_path = KEYS_DIR / f"{args.name}.pub"
+            if key_path.exists() and args.force:
+                print(
+                    f"WARNING: key '{args.name}' already exists. Overwriting it "
+                    f"invalidates EVERY seal previously signed by this key — they "
+                    f"will fail verification as UNTRUSTED with no recovery path."
+                )
+                confirm = input(f"Type the key name '{args.name}' to confirm overwrite: ")
+                if confirm.strip() != args.name:
+                    print("Aborted: confirmation did not match. Key left unchanged.")
+                    return
+                _ensure_dirs()
+                stamp = int(time.time())
+                archived = []
+                for src in (key_path, pub_path):
+                    if src.exists():
+                        backup = src.with_name(f"{src.name}.bak.{stamp}")
+                        mode = 0o600 if src.suffix == ".key" else 0o644
+                        _atomic_write_bytes(backup, src.read_bytes(), mode=mode)
+                        archived.append(backup.name)
+                AuditChain.log("keygen_force_overwrite", {"name": args.name, "archived": archived})
+                print(f"Archived previous keypair: {', '.join(archived)}")
+
             passphrase = None
             if args.encrypt:
                 import getpass

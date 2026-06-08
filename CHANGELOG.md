@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-06-08
+
+Security-hardening release. Seven RT-2026-05-29 findings closed; four are caller-visible behavior changes (redaction scope, oversize-input handling, `keygen --force`, dependency ranges). No new features. Test suite: 420 passing, 2 skipped — no previously-green test went red.
+
+### Security
+
+- **Redaction now catches space-separated and unlabeled credential values (RT-2026-05-29-001).** `_redact_body` previously missed multi-token secrets like `Bearer <token>` and bare provider tokens. It now redacts `Bearer <token>` forms and unlabeled provider tokens (`sk-…`, `gh[pousr]_…`, `AIza…`).
+- **`conversation_history` now runs through `InputNormalizer` (RT-2026-05-29-002).** Prior versions only HTML-escaped history entries, so an encoded payload (base64 / hex / ROT13) planted in conversation history bypassed the normalization applied to live user input. History is now normalized the same way as fresh input.
+- **Oversize input is truncated-then-scanned instead of passed through (RT-2026-05-29-003).** Input above `SIGIL_NORMALIZE_MAX_BYTES` previously short-circuited and returned verbatim, so a payload hidden past the cap reached the model unscanned. It is now truncated to the cap and scanned; the dropped tail cannot reach the model.
+- **Corrupt `revoked.json` fails closed (RT-2026-05-29-004).** A garbled CRL previously crashed seal verification with a raw traceback (DoS). It now sets an internal unreadable flag and `verify()` rejects every seal with `CRL_UNREADABLE`, logging the parse error to the audit chain. Deliberately fails closed rather than treating the CRL as empty — the "empty" path would have silently un-revoked every seal.
+- **`keygen --force` archives and confirms before overwriting (RT-2026-05-29-007).** Interactive `keygen --force` on an existing key now warns, requires the operator to type the key name, and archives the old keypair to `<name>.{key,pub}.bak.<ts>` before writing. Programmatic `Keyring.generate(force=True)` is unchanged.
+
+### Changed
+
+- **`_redact_body` redacts more aggressively (RT-2026-05-29-001).** Multi-token and unlabeled provider tokens are now caught. Legitimate audit context following a credential value on the same line may also be redacted. Over-redaction loses log detail; under-redaction leaks secrets — this errs toward the former.
+- **`InputNormalizer.normalize` no longer returns oversize input verbatim (RT-2026-05-29-003).** Direct callers that relied on oversize passthrough now receive truncated output. `build_context` is unaffected (it already truncates to `max_input_length` first).
+- **Dependency ranges gained upper bounds (RT-2026-05-29-006).** `pynacl>=1.5,<2`, `httpx>=0.25,<1`, `python-dotenv>=1.0,<2`, `tiktoken>=0.7,<1`, `pytest>=7.0,<10`. A `pip install sigil-security` that skips `requirements-lock.txt` can no longer silently pull a breaking or compromised next major into the crypto path. Locked versions all satisfy the new ranges; `requirements-lock.txt` remains the reproducible-install source of truth.
+
+### Fixed
+
+- **Stale `SECURITY_ALERT` wording corrected (RT-2026-05-29-008).** The alert text still described the old decode-into-prompt model; since v1.7 the normalizer redacts rather than decodes. Wording now matches the redact behavior.
+
+### Notes
+
+- **Punted:** audit-log rotation for `chain.jsonl` / `audit_records.jsonl` (RT-2026-05-29-005). A tamper-evidence-preserving rotation (segment-with-anchor, not truncation) is a design item, tracked in `.red_team/followups.md` for a v1.8.1+ round.
+- No new dependencies. Every fix reused existing atomic-write helpers, `AuditChain` logging, `_sanitize_user_input`, the `rotate_key` archival shape, and stdlib (`re`, `json`, `time`).
+
+### Migration from 1.7.0
+
+Four caller-visible changes. Callers using `build_context` or the CLI are mostly unaffected.
+
+**1. `InputNormalizer.normalize` truncates oversize input.**
+
+If you call `normalize()` directly on input above `SIGIL_NORMALIZE_MAX_BYTES` and depended on getting the full input back, you now get it truncated to the cap. Chunk before the cap if you need the tail scanned.
+
+**2. Audit-log redaction is more aggressive.**
+
+If you parse `response_preview` or request bodies out of audit records, expect more redaction spans, including context adjacent to a credential on the same line.
+
+**3. `keygen --force` is interactive on an existing key.**
+
+Scripts that ran `keygen --force` non-interactively to clobber a key will now block on a confirmation prompt. Use the programmatic `Keyring.generate(force=True)` path for unattended overwrite; the old keypair is archived either way.
+
+**4. Pinned upper bounds on dependencies.**
+
+If your environment requires a newer major of any dependency, the loosened range is no longer permitted by `pyproject.toml`. Override in your own environment if you accept the risk; `requirements-lock.txt` is unchanged.
+
 ## [1.7.0] - 2026-05-04
 
 ### Highlights
@@ -441,7 +488,8 @@ SIGIL follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (0.X.0): New features, backward compatible
 - **PATCH** (0.0.X): Bug fixes, backward compatible
 
-[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/mr-gl00m/sigil/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/mr-gl00m/sigil/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/mr-gl00m/sigil/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/mr-gl00m/sigil/releases/tag/v1.6.0
