@@ -12,11 +12,11 @@ Subject line: `[SIGIL SECURITY] <short summary>`
 
 Useful contents:
 - A description of the vulnerability and the impact you can demonstrate.
-- A minimal reproducer — code, prompts, or steps. The shorter the better.
+- A minimal reproducer: code, prompts, or steps. The shorter the better.
 - The SIGIL version (`python sigil.py --version`) and Python version.
 - Your preferred name (or pseudonym) for credit, or a request for anonymity.
 
-A PGP key is not currently published. Plaintext email is acceptable for the threat model SIGIL targets — if you need an encrypted channel for an unusually sensitive report, mention it in your first email and I'll set up Signal or a one-time PGP key.
+A PGP key is not currently published. Plaintext email is acceptable for the threat model SIGIL targets. If you need an encrypted channel for an unusually sensitive report, mention it in your first email and I'll set up Signal or a one-time PGP key.
 
 ## What to Expect
 
@@ -27,7 +27,7 @@ A PGP key is not currently published. Plaintext email is acceptable for the thre
 | Fix in `main` for confirmed CRITICAL or HIGH issues | Within 14 days |
 | Coordinated disclosure window | 90 days from acknowledgement, or sooner if a fix ships |
 
-These are targets for a solo-maintained project. If a deadline slips, you'll get a status update — not silence.
+These are targets for a solo-maintained project. If a deadline slips, you'll get a status update, not silence.
 
 ## Scope
 
@@ -37,20 +37,20 @@ In scope:
 - Anything that causes SIGIL's own code to behave differently than what the README, pitch documents, or whitepaper assert.
 
 Out of scope:
-- Vulnerabilities in `pynacl`, `httpx`, `tiktoken`, or other dependencies — report those upstream.
-- LLM behaviors that are not SIGIL's responsibility (a model that ignores signed instructions is doing what models do; SIGIL is a flight recorder, not a force field, and the README says so).
+- Vulnerabilities in `pynacl`, `httpx`, `tiktoken`, or other dependencies; report those upstream.
+- LLM behaviors that are not SIGIL's responsibility (a model that ignores signed instructions is doing what models do; SIGIL is a flight recorder, not a force field, and the README says so). Cloudflare's Project Glasswing report ("Project Glasswing: what Mythos showed us," Bourzikas, May 2026) corroborates this scoping from production use: emergent model refusals "aren't consistent enough to serve as a complete safety boundary on their own."
 - Issues that require an attacker who already has root on the host running SIGIL. The threat model assumes the host is not yet compromised.
 - Theoretical issues with no demonstrable impact in the current codebase.
 
 ## Disclosure Policy
 
-I prefer coordinated disclosure. After a fix ships, you're welcome to publish your findings — I'll typically link your write-up from the CHANGELOG entry.
+I prefer coordinated disclosure. After a fix ships, you're welcome to publish your findings; I'll typically link your write-up from the CHANGELOG entry.
 
 If a vulnerability is being actively exploited, or if 90 days have passed without a fix, you're free to disclose publicly. Send a heads-up email so I can prepare a response.
 
 ## Safe Harbor
 
-Good-faith security research against your own SIGIL deployments — fuzzing, prompt injection trials, audit chain probing, etc. — is welcome. Don't run experiments against systems you don't own or have explicit permission to test, and don't exfiltrate data beyond what's needed to demonstrate the issue.
+Good-faith security research against your own SIGIL deployments (fuzzing, prompt injection trials, audit chain probing, etc.) is welcome. Don't run experiments against systems you don't own or have explicit permission to test, and don't exfiltrate data beyond what's needed to demonstrate the issue.
 
 ## Past Reports
 

@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 from sigil import (
     SigilSeal, SigilRuntime, Architect, AuditChain,
     HumanGate, Classification, GovernanceAction, vow,
-    ToolInvocation,
+    ToolInvocation, Validator, RuntimeManifest,
 )
 
 
@@ -302,6 +302,7 @@ class InputNormalizer:
         encoding_type: str,
         original_text: str,
         decoded_form: str,
+        decoded_payloads: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Record the encoded payload + would-be-decoded form to AuditChain.
 
@@ -310,7 +311,7 @@ class InputNormalizer:
         Truncates both fields so a multi-MB payload doesn't bloat chain.jsonl.
         """
         try:
-            AuditChain.log("input_payload_redacted", {
+            event = {
                 "encoding": encoding_type,
                 "original_preview": original_text[:512],
                 "decoded_preview": decoded_form[:512],
@@ -319,7 +320,11 @@ class InputNormalizer:
                 "original_sha256": hashlib.sha256(
                     original_text.encode("utf-8", errors="replace")
                 ).hexdigest(),
-            })
+            }
+            if decoded_payloads is not None:
+                event["decoded_payloads"] = decoded_payloads[:20]
+                event["decoded_payload_count"] = len(decoded_payloads)
+            AuditChain.log("input_payload_redacted", event)
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning(
                 "AuditChain.log(input_payload_redacted) failed: %s", exc
@@ -404,7 +409,12 @@ class InputNormalizer:
             was_b64, decoded = cls.detect_and_decode_base64(current_text)
             if was_b64:
                 warnings.append(f"BASE64_ENCODING_DETECTED_AND_REDACTED (layer {depth + 1})")
-                cls._log_redacted_payload("BASE64", current_text, decoded)
+                cls._log_redacted_payload(
+                    "BASE64",
+                    current_text,
+                    decoded,
+                    decoded_payloads=cls._collect_base64_payloads(current_text),
+                )
                 current_text = cls._redact_base64_slices(current_text)
                 changed = True
                 continue
@@ -413,7 +423,12 @@ class InputNormalizer:
             was_hex, decoded = cls.detect_hex_encoding(current_text)
             if was_hex:
                 warnings.append(f"HEX_ENCODING_DETECTED_AND_REDACTED (layer {depth + 1})")
-                cls._log_redacted_payload("HEX", current_text, decoded)
+                cls._log_redacted_payload(
+                    "HEX",
+                    current_text,
+                    decoded,
+                    decoded_payloads=cls._collect_hex_payloads(current_text),
+                )
                 current_text = cls._redact_hex_slices(current_text)
                 changed = True
                 continue
@@ -451,6 +466,52 @@ class InputNormalizer:
             warnings.append(f"MAX_DECODE_DEPTH_REACHED ({max_depth} layers)")
 
         return current_text, warnings
+
+    @classmethod
+    def _payload_record(cls, encoding_type: str, candidate: str, decoded: str) -> Dict[str, Any]:
+        return {
+            "encoding": encoding_type,
+            "encoded_preview": candidate[:256],
+            "decoded_preview": decoded[:256],
+            "encoded_length": len(candidate),
+            "decoded_length": len(decoded),
+            "encoded_sha256": hashlib.sha256(
+                candidate.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "decoded_sha256": hashlib.sha256(
+                decoded.encode("utf-8", errors="replace")
+            ).hexdigest(),
+        }
+
+    @classmethod
+    def _collect_base64_payloads(cls, text: str) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for match in cls.BASE64_PATTERN.finditer(text):
+            candidate = match.group(0)
+            try:
+                decoded = base64.b64decode(candidate, validate=True)
+                decoded_str = decoded.decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                continue
+            if decoded_str.isprintable() or "\n" in decoded_str:
+                payloads.append(cls._payload_record("BASE64", candidate, decoded_str))
+        return payloads
+
+    @classmethod
+    def _collect_hex_payloads(cls, text: str) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for match in cls.HEX_PATTERN.finditer(text):
+            candidate = match.group(0)
+            hex_part = candidate[2:] if candidate.startswith("0x") else candidate
+            if len(hex_part) % 2 != 0:
+                continue
+            try:
+                decoded = bytes.fromhex(hex_part).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if decoded.isprintable() or "\n" in decoded:
+                payloads.append(cls._payload_record("HEX", candidate, decoded))
+        return payloads
 
     @classmethod
     def _redact_base64_slices(cls, text: str) -> str:
@@ -646,20 +707,16 @@ WHAT ACTUALLY ENFORCES THIS:
         context_parts = [ContextArchitect.TRUST_PREAMBLE]
 
         # Ironclad section: The signed instruction
-        context_parts.append(f"""<IRONCLAD_CONTEXT sigil_node="{seal.node_id}" signature="{seal.signature[:32] if seal.signature else 'unsigned'}...">
-{seal.instruction}
-
-ALLOWED TOOLS: {json.dumps(seal.allowed_tools) if seal.allowed_tools else 'none'}
-METADATA: {json.dumps(seal.metadata) if seal.metadata else 'none'}
-</IRONCLAD_CONTEXT>
-
-""")
+        ironclad_block = IntegrityReceipt.render_ironclad_context(seal)
+        context_parts.append(ironclad_block)
 
         # v1.7: integrity receipt — per-request HMAC the model is asked to
         # echo so SIGIL can prove the response was conditioned on the seal
         # in *this* request rather than a memorized or replayed answer.
         if integrity_receipt:
-            _nonce, _canary, receipt_block = IntegrityReceipt.embed(seal)
+            _nonce, _canary, receipt_block = IntegrityReceipt.embed(
+                seal, ironclad_block
+            )
             context_parts.append(receipt_block)
 
         # Tool definitions (if any) — sanitize descriptions/params to prevent injection.
@@ -744,7 +801,7 @@ class WorkflowNode:
     transitions: Dict[str, str] = field(default_factory=dict)
     requires_approval: bool = False
     on_error: str = "halt"
-    allowed_context_keys: set = field(default_factory=set)
+    allowed_context_keys: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -767,11 +824,34 @@ class WorkflowEngine:
     3. Whether to pause for human approval
     """
 
-    def __init__(self, runtime: SigilRuntime, strict_transitions: bool = True):
+    DEFAULT_MAX_HISTORY_ENTRIES = 200
+    DEFAULT_MAX_CONTEXT_VALUE_LENGTH = 4096
+
+    def __init__(
+        self,
+        runtime: SigilRuntime,
+        strict_transitions: bool = True,
+        max_history_entries: int = DEFAULT_MAX_HISTORY_ENTRIES,
+        max_context_value_length: int = DEFAULT_MAX_CONTEXT_VALUE_LENGTH,
+    ):
         self.runtime = runtime
         self.strict_transitions = strict_transitions
+        self.max_history_entries = max(1, max_history_entries)
+        self.max_context_value_length = max(1, max_context_value_length)
         self.workflows: Dict[str, Dict[str, WorkflowNode]] = {}
         self.running: Dict[str, WorkflowState] = {}
+
+    def _append_history(self, state: WorkflowState, role: str, content: str) -> None:
+        """Append bounded workflow history so long sessions cannot grow forever."""
+        state.history.append({"role": role, "content": content})
+        overflow = len(state.history) - self.max_history_entries
+        if overflow > 0:
+            del state.history[:overflow]
+            AuditChain.log("workflow_history_pruned", {
+                "workflow_id": state.workflow_id,
+                "entries_pruned": overflow,
+                "max_history_entries": self.max_history_entries,
+            })
 
     def register_workflow(self, workflow_id: str, nodes: Dict[str, WorkflowNode]):
         """Register a workflow (collection of nodes with transitions)."""
@@ -837,7 +917,7 @@ After processing the user input, respond with:
 
         full_context = context + workflow_context
 
-        state.history.append({"role": "user", "content": user_input})
+        self._append_history(state, "user", user_input)
         state.step_count += 1
 
         AuditChain.log("workflow_step", {
@@ -863,19 +943,29 @@ After processing the user input, respond with:
         workflow = self.workflows.get(state.workflow_id, {})
         current_node = workflow.get(state.current_node)
 
-        # Parse context updates with allowlist enforcement
+        # Parse context updates with deny-by-default allowlist enforcement.
         for match in re.finditer(r'<CONTEXT_UPDATE\s+(\w+)="([^"]*)">', response_text):
             key, value = match.group(1), match.group(2)
-            # If the node has an allowlist, enforce it
-            if current_node and current_node.allowed_context_keys:
-                if key not in current_node.allowed_context_keys:
-                    AuditChain.log("context_update_blocked", {
-                        "workflow_id": state.workflow_id,
-                        "node": state.current_node,
-                        "blocked_key": key,
-                        "step": state.step_count
-                    })
-                    continue
+            if not current_node or key not in current_node.allowed_context_keys:
+                AuditChain.log("context_update_blocked", {
+                    "workflow_id": state.workflow_id,
+                    "node": state.current_node,
+                    "blocked_key": key,
+                    "step": state.step_count,
+                    "reason": "key_not_allowlisted",
+                })
+                continue
+            if len(value) > self.max_context_value_length:
+                AuditChain.log("context_update_blocked", {
+                    "workflow_id": state.workflow_id,
+                    "node": state.current_node,
+                    "blocked_key": key,
+                    "step": state.step_count,
+                    "reason": "value_too_long",
+                    "length": len(value),
+                    "max_length": self.max_context_value_length,
+                })
+                continue
             state.context_data[key] = value
 
         # Parse transition
@@ -883,13 +973,14 @@ After processing the user input, respond with:
         next_node = None
         if transition_match:
             target = transition_match.group(1)
+            from_node = state.current_node
             # Validate the transition is allowed
             if current_node and target in current_node.transitions.values():
                 state.current_node = target
                 next_node = target
                 AuditChain.log("workflow_transition", {
                     "workflow_id": state.workflow_id,
-                    "from_node": state.current_node,
+                    "from_node": from_node,
                     "to_node": target,
                     "step": state.step_count
                 })
@@ -909,13 +1000,13 @@ After processing the user input, respond with:
                     next_node = target
                     AuditChain.log("workflow_transition_undeclared", {
                         "workflow_id": state.workflow_id,
-                        "from_node": state.current_node,
+                        "from_node": from_node,
                         "to_node": target,
                         "step": state.step_count
                     })
 
         # Record assistant response in history
-        state.history.append({"role": "assistant", "content": response_text})
+        self._append_history(state, "assistant", response_text)
 
         return next_node
 
@@ -1286,29 +1377,18 @@ class ConsistencyResult:
 
 
 class IntegrityReceipt:
-    """v1.7 marquee feature: HMAC-based proof-of-conditioning per request.
+    """HMAC prompt-conditioning canary bound to the rendered instruction and runtime.
 
-    Most prompt-security tooling stops at "the seal was verified before the
-    call." That doesn't prove the model conditioned on the seal during the
-    call — a compromised provider could ignore IRONCLAD_CONTEXT entirely,
-    a tampered prompt could get rewritten in flight, or a memorized
-    response could be replayed without the model actually reading the
-    current context. IntegrityReceipt closes that gap.
-
-    Each request mints a per-request nonce and computes
-    ``canary = HMAC(_system.key, nonce ‖ seal_hash)[:16]``. The canary
-    rides inside ``<SIGIL_INTEGRITY_RECEIPT nonce="...">`` next to
-    IRONCLAD_CONTEXT, formatted as ``[INTEGRITY-RECEIPT: <canary>]``.
-    The trust preamble instructs the model to copy the bracketed token
-    verbatim into its response. Validator recomputes the HMAC and matches.
-
-    The model can't forge a valid canary without the system key. The
-    attacker who reads the prompt has the nonce and the seal hash but
-    not the key, so they can't compute the expected canary either —
-    they can only echo what's already in the prompt, which is the right
-    behaviour. A response that contains the correct canary is
-    cryptographic evidence the model both saw the real seal and produced
-    its response in the context of *this* request.
+    Each request mints a fresh nonce and a token bound to that nonce, the seal
+    hash, the exact rendered IRONCLAD_CONTEXT block, and the signed runtime
+    manifest hash. A matching echoed token shows the request and response path
+    preserved those bytes: stripping or rewriting the instruction, or swapping
+    the runtime, changes the expected canary. The model cannot forge a valid
+    canary without the system key, and a prompt reader has the nonce, seal hash,
+    manifest, and instruction but not the key, so it can only echo what is
+    already present. The claim excludes response correctness, tool execution,
+    and model identity; this attests token preservation on the prompt path, not
+    that generation followed the signed instruction.
     """
 
     # Format of the receipt block embedded in the prompt context. The
@@ -1316,12 +1396,17 @@ class IntegrityReceipt:
     # canary token is what the model is expected to echo.
     _RECEIPT_BLOCK_RE = re.compile(
         r'<SIGIL_INTEGRITY_RECEIPT nonce="([0-9a-f]+)">\s*'
+        r'\[RUNTIME-MANIFEST: ([0-9a-f]+)\]\s*'
         r'\[INTEGRITY-RECEIPT: ([0-9a-f]+)\]\s*'
         r'</SIGIL_INTEGRITY_RECEIPT>',
         re.IGNORECASE,
     )
     _RESPONSE_RECEIPT_RE = re.compile(
         r'\[INTEGRITY-RECEIPT:\s*([0-9a-f]+)\]', re.IGNORECASE
+    )
+    _IRONCLAD_BLOCK_RE = re.compile(
+        r'(<IRONCLAD_CONTEXT\b[^>]*>.*?</IRONCLAD_CONTEXT>\s*)',
+        re.IGNORECASE | re.DOTALL,
     )
 
     # RT-2026-05-04B-001: domain-separated HMAC subkey derivation. The
@@ -1334,9 +1419,27 @@ class IntegrityReceipt:
     _HMAC_KEY_DOMAIN = b"sigil-integrity-receipt-v1\x00"
 
     @staticmethod
-    def _compute_canary(seal: SigilSeal, nonce_hex: str) -> str:
-        """Compute the canary for (seal, nonce). Pure function — same
-        inputs always produce the same output.
+    def render_ironclad_context(seal: SigilSeal) -> str:
+        """Render the exact signed instruction block bound by the receipt."""
+        return f"""<IRONCLAD_CONTEXT sigil_node="{seal.node_id}" signature="{seal.signature[:32] if seal.signature else 'unsigned'}...">
+{seal.instruction}
+
+ALLOWED TOOLS: {json.dumps(seal.allowed_tools) if seal.allowed_tools else 'none'}
+METADATA: {json.dumps(seal.metadata) if seal.metadata else 'none'}
+</IRONCLAD_CONTEXT>
+
+"""
+
+    @staticmethod
+    def _compute_canary(
+        seal: SigilSeal,
+        nonce_hex: str,
+        ironclad_block: Optional[str] = None,
+        manifest_hash: Optional[str] = None,
+    ) -> str:
+        """Compute the canary for the seal, nonce, rendered block, and manifest.
+
+        Pure function: the same inputs always produce the same output.
 
         RT-2026-05-04B-001: HMAC key is a derived subkey, not the raw
         Ed25519 signing key bytes. RT-2026-05-04B-002: canary truncated
@@ -1349,15 +1452,30 @@ class IntegrityReceipt:
             IntegrityReceipt._HMAC_KEY_DOMAIN + signer.encode()
         ).digest()
         seal_hash = seal.content_hash()
+        bound_block = (
+            ironclad_block
+            if ironclad_block is not None
+            else IntegrityReceipt.render_ironclad_context(seal)
+        )
+        block_hash = _hashlib_mod.sha256(bound_block.encode("utf-8")).digest()
         mac = _hmac_mod.new(
             hmac_key,
-            nonce_hex.encode("ascii") + seal_hash.encode("ascii"),
+            nonce_hex.encode("ascii")
+            + b"\x00"
+            + seal_hash.encode("ascii")
+            + b"\x00"
+            + block_hash
+            + b"\x00"
+            + (manifest_hash or "").encode("ascii"),
             _hashlib_mod.sha256,
         )
         return mac.hexdigest()[:32]
 
     @staticmethod
-    def embed(seal: SigilSeal) -> Tuple[str, str, str]:
+    def embed(
+        seal: SigilSeal,
+        ironclad_block: Optional[str] = None,
+    ) -> Tuple[str, str, str]:
         """Generate a fresh (nonce, canary, block_string) triple for a seal.
 
         Returns:
@@ -1366,9 +1484,13 @@ class IntegrityReceipt:
             payload ready to splice into the prompt context.
         """
         nonce = os.urandom(16).hex()
-        canary = IntegrityReceipt._compute_canary(seal, nonce)
+        manifest_hash = RuntimeManifest.current()["manifest_hash"]
+        canary = IntegrityReceipt._compute_canary(
+            seal, nonce, ironclad_block, manifest_hash
+        )
         block = (
             f'<SIGIL_INTEGRITY_RECEIPT nonce="{nonce}">\n'
+            f'[RUNTIME-MANIFEST: {manifest_hash}]\n'
             f'[INTEGRITY-RECEIPT: {canary}]\n'
             f'</SIGIL_INTEGRITY_RECEIPT>\n\n'
         )
@@ -1379,23 +1501,27 @@ class IntegrityReceipt:
         seal: SigilSeal,
         context_str: str,
         response_str: str,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[Optional[bool], str]:
         """Verify the response echoed the canary the prompt advertised.
 
         Returns (verified, reason). Reasons:
-            "ok"            — receipt present and matches expected canary
-            "no_receipt_block_in_context" — context never had a receipt
+            "ok"            means receipt present and matching
+            "no_receipt_block_in_context" means context had no receipt
                               block to verify against
-            "missing"       — context had a block but the response
-                              contained no [INTEGRITY-RECEIPT: ...] token
-            "mismatch"      — response contained a token but it did not
-                              match the canary derived from (seal, nonce)
+            "missing"       means the response had no receipt token
+            "mismatch"      means the token did not match the bound context
         """
         block_match = IntegrityReceipt._RECEIPT_BLOCK_RE.search(context_str)
         if not block_match:
-            return False, "no_receipt_block_in_context"
+            return None, "no_receipt_block_in_context"
+        ironclad_match = IntegrityReceipt._IRONCLAD_BLOCK_RE.search(context_str)
+        if not ironclad_match:
+            return False, "no_ironclad_block_in_context"
         nonce = block_match.group(1)
-        expected_canary = IntegrityReceipt._compute_canary(seal, nonce)
+        manifest_hash = block_match.group(2)
+        expected_canary = IntegrityReceipt._compute_canary(
+            seal, nonce, ironclad_match.group(1), manifest_hash
+        )
 
         response_match = IntegrityReceipt._RESPONSE_RECEIPT_RE.search(response_str)
         if not response_match:
@@ -1404,6 +1530,9 @@ class IntegrityReceipt:
         actual_canary = response_match.group(1).lower()
         if not _hmac_compare(actual_canary, expected_canary):
             return False, "mismatch"
+        manifest_valid, _ = RuntimeManifest.verify_stored(manifest_hash)
+        if not manifest_valid:
+            return False, "runtime_manifest_invalid"
         return True, "ok"
 
 
@@ -1558,6 +1687,15 @@ class UncertaintyGate:
     The embedding service is a load-bearing dependency: if Ollama is
     unreachable, the gate fails closed (treats as inconsistent and abstains).
     Tests inject a fake EmbeddingClient via the embedding_client kwarg.
+
+    Scope: self-consistency is hallucination/abstention machinery, not
+    adversarial validation. All k samples come from the same model, so an
+    injection that reliably steers that model yields k consistent wrong
+    answers and passes the gate. Independent disagreement (a separate
+    validator seal today, cross-provider comparison per the v2 roadmap) is
+    the noise-reduction path for adversarial inputs; Cloudflare's Project
+    Glasswing report (May 2026) found deliberate two-agent disagreement
+    materially more effective than asking one agent to check itself.
     """
 
     DEFAULT_ABSTENTION_MESSAGE = (
@@ -1682,6 +1820,24 @@ class UncertaintyGate:
                 responses=[],
                 primary_response="",
                 abstention_message="Failed to generate any responses."
+            )
+
+        if len(responses) != self.k_samples:
+            AuditChain.log("uncertainty_abstention", {
+                "k_samples_requested": self.k_samples,
+                "k_samples_completed": len(responses),
+                "confidence": 0.0,
+                "reason": "incomplete_sample_set",
+            })
+            return ConsistencyResult(
+                is_consistent=False,
+                confidence_score=0.0,
+                responses=responses,
+                primary_response="",
+                abstention_message=(
+                    abstention_message
+                    or "Failed to generate every response required for consistency checking."
+                ),
             )
 
         # Single-response fast path — no embedding needed.
@@ -1858,6 +2014,33 @@ class ToolRegistry:
             )
         if invocation.resolved_tool not in self.tools:
             raise ValueError(f"Unknown tool: {invocation.resolved_tool}")
+
+        if invocation.parameters != kwargs:
+            AuditChain.log("tool_denied", {
+                "capability_id": invocation.capability_id,
+                "seal_node": seal.node_id,
+                "reason": "execution_parameters_differ_from_invocation",
+            })
+            raise ValueError(
+                "Execution parameters differ from the validated ToolInvocation"
+            )
+
+        revalidated = ToolInvocation(
+            capability_id=invocation.capability_id,
+            parameters=dict(kwargs),
+        )
+        Validator.validate_invocation(seal, revalidated)
+        if revalidated.resolved_tool != invocation.resolved_tool:
+            raise PermissionError("Capability resolution changed during execution")
+        if Validator.check_escalation(seal, revalidated):
+            AuditChain.log("tool_denied", {
+                "capability_id": invocation.capability_id,
+                "seal_node": seal.node_id,
+                "reason": "effect_escalation_requires_execution_proof",
+            })
+            raise PermissionError(
+                "Effect escalation requires a verified HumanGate execution path"
+            )
 
         kwargs_preview = {k: str(v)[:100] for k, v in kwargs.items()}
         kwargs_hash = hashlib.sha256(
@@ -2088,7 +2271,7 @@ Always be helpful and professional.""",
 |           User input quarantined in <USER_DATA>                             |
 |                                                                             |
 |  Layer 3: Input Normalization                                               |
-|           Base64/ROT13/Hex decoded before LLM sees it                       |
+|           Base64/ROT13/Hex redacted before LLM sees it                      |
 |                                                                             |
 |  Layer 4: HTML Entity Escaping                                              |
 |           All < and > escaped in user input and conversation history        |

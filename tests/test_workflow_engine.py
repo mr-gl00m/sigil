@@ -81,3 +81,61 @@ def test_step_adds_to_history(workflow_setup):
     engine.step(state, "my input")
     assert len(state.history) == 1
     assert state.history[0]["content"] == "my input"
+
+
+def test_context_update_denied_without_allowlist(workflow_setup):
+    """Model-emitted context tags are deny-by-default."""
+    engine, nodes, _, _ = workflow_setup
+    engine.register_workflow("wf_tags", nodes)
+    state = engine.start("wf_tags", "step_a")
+
+    engine.process_response('ok <CONTEXT_UPDATE is_admin="true">', state)
+
+    assert "is_admin" not in state.context_data
+
+
+def test_context_update_requires_allowlisted_key(workflow_setup):
+    """Only explicitly allowlisted context keys are accepted."""
+    engine, nodes, _, _ = workflow_setup
+    nodes["step_a"].allowed_context_keys = {"ticket_id"}
+    engine.register_workflow("wf_allowed_tags", nodes)
+    state = engine.start("wf_allowed_tags", "step_a")
+
+    engine.process_response(
+        'ok <CONTEXT_UPDATE ticket_id="123"><CONTEXT_UPDATE is_admin="true">',
+        state,
+    )
+
+    assert state.context_data == {"ticket_id": "123"}
+
+
+def test_context_update_value_length_is_bounded(workflow_setup):
+    """Allowlisted keys still reject oversized values."""
+    engine, nodes, _, _ = workflow_setup
+    engine.max_context_value_length = 4
+    nodes["step_a"].allowed_context_keys = {"note"}
+    engine.register_workflow("wf_bounded_value", nodes)
+    state = engine.start("wf_bounded_value", "step_a")
+
+    engine.process_response('ok <CONTEXT_UPDATE note="12345">', state)
+
+    assert "note" not in state.context_data
+
+
+def test_workflow_history_is_pruned(workflow_setup):
+    """Long-running workflows keep bounded in-memory history."""
+    engine, nodes, _, _ = workflow_setup
+    engine.max_history_entries = 3
+    engine.register_workflow("wf_history", nodes)
+    state = engine.start("wf_history", "step_a")
+
+    for i in range(3):
+        engine.step(state, f"user-{i}")
+        engine.process_response(f"assistant-{i}", state)
+
+    assert len(state.history) == 3
+    assert state.history == [
+        {"role": "assistant", "content": "assistant-1"},
+        {"role": "user", "content": "user-2"},
+        {"role": "assistant", "content": "assistant-2"},
+    ]

@@ -48,6 +48,8 @@ def sigil_isolation(tmp_path, monkeypatch):
     # Reset system signer so each test gets its own audit signing key (C-01)
     monkeypatch.setattr(sigil.AuditChain, "_system_signer", None)
     monkeypatch.setattr(sigil.AuditChain, "_system_key_id", None)
+    monkeypatch.setattr(sigil.RuntimeManifest, "_cache_hash", None)
+    monkeypatch.setattr(sigil.RuntimeManifest, "_cache_manifest", None)
 
     # Monkeypatch sigil_audit_proxy module
     import sigil_audit_proxy

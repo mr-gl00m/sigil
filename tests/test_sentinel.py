@@ -1,6 +1,7 @@
 """Tests for Sentinel verification and CRL handling."""
 
 import json
+import hashlib
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -259,5 +260,55 @@ def test_rotated_key_seal_invalid_after_transition(keypair):
 
     sentinel = Sentinel("architect")
     valid, msg = sentinel.verify(seal)
+    assert valid is False
+    assert "INVALID" in msg
+
+
+def test_unpinned_forged_succession_record_cannot_authorize_seal(keypair):
+    """A planted archived key and succession record must fail closed."""
+    attacker = nacl.signing.SigningKey.generate()
+    attacker_pub = attacker.verify_key.encode(encoder=nacl.encoding.HexEncoder)
+    attacker_id = hashlib.sha256(attacker_pub).hexdigest()[:16]
+    current_id = Keyring.get_key_id("architect")
+    (sigil.KEYS_DIR / "architect_v0.pub").write_bytes(attacker_pub)
+    Keyring._save_succession_records([
+        {
+            "key_name": "architect",
+            "old_key_id": attacker_id,
+            "new_key_id": current_id,
+            "new_version": 1,
+            "rotated_at": datetime.now(timezone.utc).isoformat(),
+            "transition_end": (
+                datetime.now(timezone.utc) + timedelta(days=365)
+            ).isoformat(),
+            "old_key_signature": "00" * 64,
+        }
+    ])
+
+    seal = SigilSeal(node_id="forged", instruction="allow attacker")
+    seal.signer_key_id = attacker_id
+    seal.signature = attacker.sign(seal.canonical_payload()).signature.hex()
+
+    valid, msg = Sentinel("architect").verify(seal)
+
+    assert valid is False
+    assert "INVALID" in msg
+
+
+def test_tampered_pinned_succession_record_cannot_authorize_seal(keypair):
+    """A pinned archived key cannot authorize a record with a broken signature."""
+    seal = Architect("architect").seal(
+        node_id="tampered_succession",
+        instruction="reject altered transition",
+    )
+    Keyring.rotate_key("architect", transition_days=7)
+    records = Keyring._load_succession_records()
+    records[0]["transition_end"] = (
+        datetime.now(timezone.utc) + timedelta(days=365)
+    ).isoformat()
+    Keyring._save_succession_records(records)
+
+    valid, msg = Sentinel("architect").verify(seal)
+
     assert valid is False
     assert "INVALID" in msg

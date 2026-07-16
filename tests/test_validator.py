@@ -171,6 +171,14 @@ class TestParameterValidation:
         with pytest.raises(ValueError, match="expected int"):
             Validator.validate_invocation(constrained_seal, inv)
 
+    def test_bool_rejected_for_int_param(self, constrained_seal, cap_map):
+        inv = ToolInvocation(
+            capability_id=cap_map["web_search"],
+            parameters={"query": "test", "limit": True},
+        )
+        with pytest.raises(ValueError, match="expected int"):
+            Validator.validate_invocation(constrained_seal, inv)
+
     def test_unexpected_parameter_rejected(self, constrained_seal, cap_map):
         inv = ToolInvocation(
             capability_id=cap_map["web_search"],

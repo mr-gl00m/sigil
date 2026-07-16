@@ -2,7 +2,7 @@
 
 import pytest
 
-from sigil import SigilSeal
+from sigil import EffectClass, SigilSeal, ToolInvocation, Validator
 from sigil_llm_adapter import ToolRegistry
 
 
@@ -193,6 +193,8 @@ def test_execute_validated_runs_resolved_tool():
         return f"transferred {amount}"
 
     seal = _make_capability_seal()
+    seal.allowed_effects = [EffectClass.WRITE.value]
+    Validator.register_tool_effect("transfer", EffectClass.WRITE)
     invocation = ToolInvocation(
         capability_id="cap_a1b2c3d4",
         parameters={"amount": 50},
@@ -239,3 +241,75 @@ def test_execute_validated_enforces_capability_match():
     )
     with pytest.raises(PermissionError, match="(?i)capability"):
         registry.execute_validated(seal, forged)
+
+
+def test_execute_validated_rechecks_parameter_constraints():
+    registry = ToolRegistry()
+
+    @registry.register("transfer", "Transfer")
+    def transfer(amount=0):
+        return amount
+
+    capability_id = "cap_a1b2c3d4"
+    seal = SigilSeal(
+        node_id="constrained",
+        instruction="test",
+        capabilities={capability_id: "transfer"},
+        parameter_constraints={
+            capability_id: {
+                "amount": {"type": "int", "max": 100, "required": True},
+            }
+        },
+        allowed_effects=[EffectClass.WRITE.value],
+        signature="fakesig" * 8,
+        signer_key_id="fakekey",
+    )
+    Validator.register_tool_effect("transfer", EffectClass.WRITE)
+    forged = ToolInvocation(
+        capability_id=capability_id,
+        parameters={"amount": 1000},
+        resolved_tool="transfer",
+        effect_class=EffectClass.WRITE,
+    )
+
+    with pytest.raises(ValueError, match="maximum"):
+        registry.execute_validated(seal, forged, amount=1000)
+
+
+def test_execute_validated_rechecks_effect_and_escalation():
+    registry = ToolRegistry()
+
+    @registry.register("transfer", "Transfer")
+    def transfer(amount=0):
+        return amount
+
+    capability_id = "cap_a1b2c3d4"
+    Validator.register_tool_effect("transfer", EffectClass.WRITE)
+    forged = ToolInvocation(
+        capability_id=capability_id,
+        parameters={"amount": 50},
+        resolved_tool="transfer",
+        effect_class=EffectClass.READ,
+    )
+    effect_denied = SigilSeal(
+        node_id="effect_denied",
+        instruction="test",
+        capabilities={capability_id: "transfer"},
+        allowed_effects=[EffectClass.READ.value],
+        signature="fakesig" * 8,
+        signer_key_id="fakekey",
+    )
+    with pytest.raises(PermissionError, match="Effect class"):
+        registry.execute_validated(effect_denied, forged, amount=50)
+
+    escalation_required = SigilSeal(
+        node_id="escalation_required",
+        instruction="test",
+        capabilities={capability_id: "transfer"},
+        allowed_effects=[EffectClass.WRITE.value],
+        escalate_effects=[EffectClass.WRITE.value],
+        signature="fakesig" * 8,
+        signer_key_id="fakekey",
+    )
+    with pytest.raises(PermissionError, match="escalation"):
+        registry.execute_validated(escalation_required, forged, amount=50)

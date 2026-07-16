@@ -1,4 +1,4 @@
-"""Tests for AuditChain Merkle-linked logging."""
+"""Tests for AuditChain signed hash-linked logging."""
 
 import json
 import hashlib
@@ -39,6 +39,22 @@ def test_verify_chain_valid():
     valid, msg = AuditChain.verify_chain()
     assert valid is True
     assert "3 entries" in msg
+
+
+def test_verify_chain_across_rotated_segments(monkeypatch):
+    """Rotation anchors the new segment to the previous segment hash."""
+    monkeypatch.setenv("SIGIL_AUDIT_CHAIN_MAX_BYTES", "1024")
+
+    for i in range(4):
+        AuditChain.log("large_event", {"seq": i, "padding": "x" * 900})
+
+    segments = AuditChain._segment_files()
+    assert segments, "expected at least one rotated audit-chain segment"
+
+    valid, msg = AuditChain.verify_chain()
+    assert valid is True
+    assert "4 entries" in msg
+    assert "segments" in msg
 
 
 def test_verify_chain_tampered_data():
@@ -167,6 +183,82 @@ def test_verify_chain_strict_rejects_unsigned():
     assert "unsigned" in msg.lower()
 
 
+def test_verify_chain_default_rejects_signature_stripping_attack():
+    """The production default must reject a rewritten unsigned chain."""
+    AuditChain.log("original", {"decision": "deny"})
+    AuditChain.log("second", {"seq": 2})
+
+    rewritten = []
+    prev_hash = "GENESIS"
+    for line in AuditChain.LOG_FILE.read_text().splitlines():
+        entry = json.loads(line)
+        entry.pop("signature")
+        entry.pop("signer_key_id")
+        entry["prev_hash"] = prev_hash
+        if entry["event"] == "original":
+            entry["data"]["decision"] = "allow"
+        unsigned_payload = {
+            key: value for key, value in entry.items() if key != "entry_hash"
+        }
+        entry["entry_hash"] = hashlib.sha256(
+            json.dumps(unsigned_payload, sort_keys=True).encode()
+        ).hexdigest()
+        prev_hash = entry["entry_hash"]
+        rewritten.append(json.dumps(entry))
+    AuditChain.LOG_FILE.write_text("\n".join(rewritten) + "\n")
+    (sigil.KEYS_DIR / "_system.pub").unlink()
+
+    valid, msg = AuditChain.verify_chain()
+
+    assert valid is False
+    assert "unsigned" in msg.lower()
+
+
+def test_verify_chain_default_rejects_unsigned_when_system_key_exists():
+    """The production default fails closed once the system key exists."""
+    AuditChain._get_system_signer()
+    entry = {
+        "timestamp": "2024-01-01T00:00:00+00:00",
+        "event": "rewritten_event",
+        "data": {"x": 1},
+        "prev_hash": "GENESIS",
+    }
+    entry["entry_hash"] = hashlib.sha256(
+        json.dumps(entry, sort_keys=True).encode()
+    ).hexdigest()
+    AuditChain.LOG_FILE.write_text(json.dumps(entry) + "\n")
+
+    valid, msg = AuditChain.verify_chain()
+
+    assert valid is False
+    assert "unsigned" in msg.lower()
+
+
+def test_verify_chain_strict_rejects_legacy_128bit_hash():
+    """RT-2026-07-15-009: a 32-char (128-bit) entry hash fails the strict default."""
+    AuditChain._get_system_signer()
+    verify_entry = {
+        "timestamp": "2024-01-01T00:00:00+00:00",
+        "event": "legacy",
+        "data": {"x": 1},
+        "prev_hash": "GENESIS",
+    }
+    full = hashlib.sha256(
+        json.dumps(verify_entry, sort_keys=True).encode()
+    ).hexdigest()
+    entry = dict(verify_entry, entry_hash=full[:32])
+    AuditChain.LOG_FILE.write_text(json.dumps(entry) + "\n")
+
+    valid, msg = AuditChain.verify_chain()
+    assert valid is False
+    assert "128-bit" in msg
+
+    # The rejection is strict-gated: explicit legacy inspection gets past the
+    # hash-width check (it then fails later as unsigned, not on hash width).
+    _, msg_legacy = AuditChain.verify_chain(strict=False)
+    assert "128-bit" not in msg_legacy
+
+
 def test_system_key_auto_generated():
     """_system.key and _system.pub are auto-created on first log()."""
     key_path = sigil.KEYS_DIR / "_system.key"
@@ -178,6 +270,35 @@ def test_system_key_auto_generated():
 
     assert key_path.exists()
     assert pub_path.exists()
+
+
+def test_system_signer_refuses_orphaned_public_key():
+    """A public key without its private half is never overwritten."""
+    pub_path = sigil.KEYS_DIR / "_system.pub"
+    orphan = nacl.signing.SigningKey.generate().verify_key.encode(
+        encoder=nacl.encoding.HexEncoder
+    )
+    pub_path.write_bytes(orphan)
+
+    with pytest.raises(RuntimeError, match="private key is missing"):
+        AuditChain._get_system_signer()
+
+    assert pub_path.read_bytes() == orphan
+    assert not (sigil.KEYS_DIR / "_system.key").exists()
+
+
+def test_system_signer_refuses_mismatched_keypair():
+    """Signing stops when the system public and private keys disagree."""
+    AuditChain._get_system_signer()
+    replacement = nacl.signing.SigningKey.generate().verify_key.encode(
+        encoder=nacl.encoding.HexEncoder
+    )
+    (sigil.KEYS_DIR / "_system.pub").write_bytes(replacement)
+    AuditChain._system_signer = None
+    AuditChain._system_key_id = None
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        AuditChain._get_system_signer()
 
 
 def test_verify_chain_signed_chain_valid():

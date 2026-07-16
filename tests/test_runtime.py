@@ -8,6 +8,7 @@ import pytest
 import sigil
 from sigil import (
     SigilRuntime, Architect, Keyring, SigilSeal, AuditChain,
+    EffectClass, ToolInvocation, Validator,
 )
 
 
@@ -91,6 +92,48 @@ def test_one_time_seal_replay_raises(architect, runtime):
 
     with pytest.raises(PermissionError, match="Replay attack"):
         runtime.execute("replay_test", "second")
+
+
+def test_one_time_validate_failure_does_not_reserve_nonce(architect, runtime):
+    """Rejected validate_and_execute attempt does not burn a one-time seal."""
+    Validator.register_tool_effect("read_file", EffectClass.READ)
+    seal = architect.seal(
+        node_id="one_time_validate_retry",
+        instruction="Read one approved file.",
+        allowed_tools=["read_file"],
+        parameter_constraints={
+            "read_file": {
+                "path": {
+                    "type": "string",
+                    "pattern": r"^/data/public/",
+                    "required": True,
+                },
+            },
+        },
+        allowed_effects=[EffectClass.READ],
+    )
+    seal.one_time = True
+    signer = Keyring.load_signer("architect")
+    signed = signer.sign(seal.canonical_payload())
+    seal.signature = signed.signature.hex()
+    seal.signer_key_id = Keyring.get_key_id("architect")
+
+    runtime.load_seal(seal)
+    cap_id = next(iter(seal.capabilities))
+
+    with pytest.raises(ValueError, match="pattern"):
+        runtime.validate_and_execute(
+            "one_time_validate_retry",
+            "bad attempt",
+            [ToolInvocation(capability_id=cap_id, parameters={"path": "/etc/shadow"})],
+        )
+
+    result = runtime.validate_and_execute(
+        "one_time_validate_retry",
+        "corrected attempt",
+        [ToolInvocation(capability_id=cap_id, parameters={"path": "/data/public/report.txt"})],
+    )
+    assert result["validated_invocations"][0]["resolved_tool"] == "read_file"
 
 
 def test_nonce_file_created(architect, runtime):

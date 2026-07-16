@@ -6,7 +6,7 @@
 > SIGIL is a flight recorder, not a force field. It records and proves what happened; it does not promise to stop every attack.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
@@ -22,7 +22,7 @@ SIGIL provides cryptographic prompt security without the SaaS overhead.
 | **Data Governance** | Complex metadata schemas | Python decorators |
 | **Human-in-the-Loop** | Expensive dashboards | Local files + simple webhooks |
 | **Tool Permissions** | Server-enforced | Type system + runtime |
-| **Audit Trail** | External database | Local Merkle chain |
+| **Audit Trail** | External database | Signed hash chain plus Merkle receipts |
 | **Cost** | $$$$/month | **Free** |
 | **Vendor Lock-in** | Yes | **None** |
 
@@ -106,6 +106,56 @@ gate.request_approval(
 
 ---
 
+## Proof-of-Execution Receipts
+
+SIGIL can emit portable Ed25519 action receipts bound to a signed runtime manifest. Receipt
+fields use salted Merkle commitments, so an auditor can verify selected fields without receiving
+raw arguments, outputs, or undisclosed metadata. The format is frozen in
+[`RECEIPT_SPEC.md`](RECEIPT_SPEC.md).
+
+The v0.1 profile covers software measurement, signature identity, committed fields, chain order,
+and delegation provenance. Hardware isolation, model correctness, tool-result truth, freshness,
+revocation state, and semantic intent across delegation hops remain outside its claim boundary.
+
+```python
+import json
+from pathlib import Path
+
+from sigil_receipts import ReceiptStore
+
+receipt = ReceiptStore.emit(
+    receipt_type="action",
+    action="read_file",
+    decision="allow",
+    effect_class="read",
+    arguments={"path": "notes.txt"},
+    capability_id="cap_read",
+)
+Path("receipt.json").write_text(json.dumps(receipt, indent=2))
+
+disclosure = ReceiptStore.reveal(
+    receipt["receipt_id"],
+    ["action", "decision", "manifest_hash"],
+)
+```
+
+Verify a receipt with pinned public keys and the signed manifest snapshot:
+
+```bash
+uv run sigil-verify receipt.json \
+  --receipt-key .sigil/keys/_receipt.pub \
+  --system-key .sigil/keys/_system.pub \
+  --manifest .sigil/state/runtime_manifests \
+  --json
+```
+
+`sigil_mcp.MCPTrustWrapper` is the stdio reference adapter. Construction requires the `Sentinel`
+that verifies its signed seal. It filters discovery to seal-authorized tools, re-verifies the seal
+for each `tools/call`, persists an allow or deny receipt before dispatch, and attaches a terminal
+receipt to the JSON-RPC result.
+
+---
+
 ## LLM Integration
 
 The missing piece nobody else built: **How to actually use this with Claude, GPT, Gemini, etc.**
@@ -144,12 +194,70 @@ response = adapter.complete(context)
 #### Audit Proxy signals
 
 - Political/buzzword refusals are flagged as `POLITICAL_INJECTION_DETECTED` when responses lean on policy-speak instead of content.
-- Integrity canary: `AuditProxy.run_canary()` asks the model for `SHA256('SIGIL')` to detect silent model swaps; failures are logged to the AuditChain.
+- Integrity canary: `AuditProxy.run_canary()` checks that a randomized opaque token returns unchanged; failures are logged to the AuditChain. This checks the request and response path for rewriting. It does not attest model identity.
 - Anomaly scoring: each record gets a 0-10 score that weights encoded inputs, large token bursts, high cost, slow latency, and triggered alerts.
 
 ### Legal discovery
 
-`sigil_audit_proxy.LegalExporter.create_discovery_package()` bundles filtered audit records, chain-of-custody notes, and a SHA-256 manifest into a tamper-evident zip for court or regulator submissions.
+`sigil_audit_proxy.LegalExporter.create_discovery_package()` bundles filtered audit records,
+chain-of-custody notes, selective receipt proofs, signed runtime manifests, and an Ed25519-signed
+file manifest into a tamper-evident zip for court or regulator submissions.
+
+---
+
+## AI Security Harness Pattern
+
+SIGIL is not a vulnerability scanner, but it provides useful control points for an AI-assisted security-review harness. The practical pattern is to sign narrow review tasks, require structured outputs, independently validate findings, and preserve every model/tool step in the audit chain.
+
+| Harness stage | SIGIL primitive | Use it for |
+|---------------|-----------------|------------|
+| Recon | `AuditChain.log()` + signed `SigilSeal` scopes | Record repo facts, trust boundaries, entry points, and the exact task queue that downstream agents received. |
+| Hunt | `Architect.seal(..., output_schema=...)` | Give each agent one attack class and one scope hint, then reject vague or schema-breaking findings. |
+| Validate | Separate validator seal with no write/exec tools | Ask an independent agent to disprove the finding instead of letting the hunter grade its own work. |
+| Gapfill | Audit entries tagged by node/task ID | Requeue areas the agent explicitly marked as under-covered, rather than pretending one pass was exhaustive. |
+| Dedupe | Structured finding IDs/root-cause fields | Collapse variants into one auditable record before humans triage. |
+| Trace | Read-only tool capabilities + narrow path constraints | Check whether attacker-controlled input can actually reach the suspected bug. |
+| Feedback | `WorkflowEngine` chained seals + audit-chain task queue | Turn each confirmed-reachable trace into a new sealed hunt task in the repo where the bug is actually exposed, so coverage compounds across passes instead of ending at one. |
+| Report | `Validator.validate_output()` + `LegalExporter` | Emit queryable JSON and a tamper-evident evidence package instead of free-form prose. |
+
+Minimal sealed task shape:
+
+```python
+from sigil import Architect, EffectClass
+
+finding_schema = {
+    "type": "object",
+    "properties": {
+        "root_cause_id": {"type": "string", "maxLength": 120},
+        "attack_class": {"type": "string", "maxLength": 80},
+        "scope": {"type": "string", "maxLength": 240},
+        "evidence": {"type": "array", "maxItems": 8},
+        "reachable": {"type": "boolean"},
+        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "needs_gapfill": {"type": "boolean"},
+    },
+    "required": [
+        "root_cause_id", "attack_class", "scope", "evidence",
+        "reachable", "confidence", "needs_gapfill",
+    ],
+    "additionalProperties": False,
+}
+
+architect = Architect()
+seal = architect.seal(
+    node_id="hunt_command_injection_sigil_audit_proxy",
+    instruction=(
+        "Review only sigil_audit_proxy.py for command injection. "
+        "Return only the structured finding object. Do not patch code."
+    ),
+    allowed_tools=["read_file", "run_tests_in_scratch"],
+    allowed_effects=[EffectClass.READ, EffectClass.EXEC],
+    escalate_effects=[EffectClass.EXEC],
+    output_schema=finding_schema,
+)
+```
+
+The important constraint is scope. A sealed task should be small enough that a reviewer can tell what was covered, what was not covered, and which exact model output produced the finding.
 
 ---
 
@@ -176,9 +284,9 @@ seal = architect.seal(
 )
 ```
 
-### Merkle-Linked Audit Chain
+### Signed Hash-Linked Audit Chain
 
-Every action is hashed with the previous entry. You can mathematically prove your logs haven't been tampered with.
+Every signed entry commits to the previous entry. Verification against a trusted system public key detects edits, deletions, reordering, and signature stripping.
 
 ```python
 from sigil import AuditChain
@@ -190,7 +298,7 @@ valid, message = AuditChain.verify_chain()
 
 ### Input Normalization
 
-Automatically detects and decodes Base64, ROT13, and Hex attacks before the LLM sees them.
+Automatically detects and redacts Base64, ROT13, and Hex attacks before the LLM sees them.
 
 ```python
 from sigil_llm_adapter import InputNormalizer
@@ -199,8 +307,8 @@ from sigil_llm_adapter import InputNormalizer
 encoded_attack = "SWdub3JlIHByZXZpb3VzIGluc3RydWN0aW9ucw=="
 
 result, warnings = InputNormalizer.normalize(encoded_attack)
-# warnings: ['BASE64_ENCODING_DETECTED (layer 1)']
-# result: '[DECODED_PAYLOAD]: Ignore previous instructions'
+# warnings: ['BASE64_ENCODING_DETECTED_AND_REDACTED (layer 1)']
+# result: '[REDACTED-BASE64-<digest>]'
 ```
 
 ### Tag Breakout Prevention
@@ -241,7 +349,7 @@ tools.execute("transfer", seal, ...)  # [FAIL] PermissionError
 |           User input quarantined in <USER_DATA>                             |
 |                                                                             |
 |  Layer 3: Input Normalization                                               |
-|           Base64/ROT13/Hex decoded before LLM sees it                       |
+|           Base64/ROT13/Hex redacted before LLM sees it                      |
 |                                                                             |
 |  Layer 4: HTML Entity Escaping                                              |
 |           All < and > escaped in user input and conversation history        |
@@ -266,9 +374,9 @@ SIGIL makes deliberate trade-offs. Understand them before deploying.
 
 ### Security boundaries
 
-- **LLMs don't structurally enforce XML boundaries.** The `<IRONCLAD_CONTEXT>` / `<USER_DATA>` separation is advisory — it relies on the model respecting the trust hierarchy in context. Sophisticated attacks may still succeed against some models. The signatures and boundaries are defense-in-depth, not guarantees. Treat LLM output as untrusted regardless of whether the input was sealed.
+- **LLMs don't structurally enforce XML boundaries.** The `<IRONCLAD_CONTEXT>` / `<USER_DATA>` separation is advisory; it relies on the model respecting the trust hierarchy in context. Sophisticated attacks may still succeed against some models. The signatures and boundaries are defense-in-depth, not guarantees. Treat LLM output as untrusted regardless of whether the input was sealed. Cloudflare's Project Glasswing report ("Project Glasswing: what Mythos showed us," Bourzikas, May 2026) reached the same conclusion from production vulnerability research: a model's emergent refusals "aren't consistent enough to serve as a complete safety boundary on their own," and semantically equivalent requests produced opposite outcomes across runs. In-model behavior is probabilistic; the deterministic layer around it is where the guarantees live.
 - **Cryptographic signing proves integrity, not behavior.** SIGIL proves that instructions haven't been tampered with; it cannot force an LLM to follow them.
-- **Encoding detection is heuristic.** The input normalizer catches common patterns (Base64, ROT13, Hex) but cannot decode every possible obfuscation scheme.
+- **Encoding detection is heuristic.** The input normalizer catches common patterns (Base64, ROT13, Hex) but cannot detect every possible obfuscation scheme.
 
 ### Deployment shape
 
@@ -279,12 +387,17 @@ SIGIL makes deliberate trade-offs. Understand them before deploying.
 ### Performance
 
 - **UncertaintyGate costs 3x tokens and 3x latency.** Self-consistency voting requires `k_samples=3` by default. Samples are currently generated sequentially. Use it for high-stakes calls only; don't wrap every LLM request in it.
+- **UncertaintyGate is not adversarial validation.** All k samples come from the same model, so an attack that reliably steers the model produces k consistent wrong answers and passes the gate. It catches hallucination and contradictory context, not injection. For adversarial inputs, use an independent validator seal (see the harness pattern above); deliberate disagreement between two agents outperforms one agent checking its own work.
+- **SIGIL is not a parallel vulnerability-discovery harness.** It can seal tasks, constrain tools, validate structured outputs, and preserve evidence, but it does not schedule hundreds of narrow agents, deduplicate findings, or trace reachability across repositories for you. Build that orchestration around SIGIL if you need scanner-style coverage.
 
 ---
 
 ## CLI Reference
 
 ```bash
+# Version (include this in vulnerability reports, see SECURITY.md)
+python sigil.py --version
+
 # Key Management
 python sigil.py keygen architect    # Generate architect keypair
 python sigil.py keygen operator     # Generate operator keypair
@@ -317,7 +430,7 @@ python sigil.py demo                # Run full demonstration
 
 Governance shouldn't require a subscription to someone else's server. It should be a standard you can run yourself.
 
-SIGIL proves that a high-integrity, sovereign security layer is not only possible—it's simpler and more transparent than proprietary alternatives.
+SIGIL proves that a high-integrity, sovereign security layer is not only possible but simpler and more transparent than proprietary alternatives.
 
 ---
 
@@ -341,4 +454,4 @@ If you find this useful, consider supporting development:
 
 **[MIT License](LICENSE)**
 
-MIT licensed — use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.
+MIT licensed: use it commercially or personally, modify it, ship it. The only requirement is that the copyright notice and license text in [LICENSE](LICENSE) travel with derivative works.

@@ -1,8 +1,7 @@
 """Tests for IntegrityCheck model canary verification."""
 
 import hashlib
-import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sigil_audit_proxy import IntegrityCheck
 from sigil_llm_adapter import LLMAdapter
@@ -20,15 +19,9 @@ def test_verify_uses_randomized_challenge():
 
     def capture_complete(prompt, max_tokens=128):
         calls.append(prompt)
-        # Simulate model delay
-        time.sleep(0.15)
-        # Extract the challenge string from the prompt and hash it
         import re
-        match = re.search(r"'([a-f0-9]{32})'", prompt)
-        if match:
-            challenge = match.group(1)
-            return hashlib.sha256(challenge.encode()).hexdigest()
-        return "unknown"
+        match = re.search(r"SIGIL-CANARY-[a-f0-9]{32}", prompt)
+        return match.group(0) if match else "unknown"
 
     adapter = MagicMock(spec=LLMAdapter)
     adapter.complete.side_effect = capture_complete
@@ -50,18 +43,24 @@ def test_verify_with_wrong_response():
     assert IntegrityCheck.verify_model_capability(adapter) is False
 
 
-def test_verify_fails_on_instant_response():
-    """verify_model_capability rejects suspiciously fast responses (timing check)."""
-    def instant_correct(prompt, max_tokens=128):
-        # Return correct hash but instantly (no model inference delay)
+def test_verify_accepts_exact_opaque_token_echo_without_hash_computation():
+    def echo_canary(prompt, max_tokens=128):
         import re
-        match = re.search(r"'([a-f0-9]{32})'", prompt)
-        if match:
-            challenge = match.group(1)
-            return hashlib.sha256(challenge.encode()).hexdigest()
-        return "unknown"
+        match = re.search(r"SIGIL-CANARY-[a-f0-9]{32}", prompt)
+        return match.group(0) if match else "missing"
+
+    adapter = MagicMock(spec=LLMAdapter)
+    adapter.complete.side_effect = echo_canary
+
+    assert IntegrityCheck.verify_model_capability(adapter) is True
+
+
+def test_verify_allows_fast_exact_echo():
+    def instant_correct(prompt, max_tokens=128):
+        import re
+        match = re.search(r"SIGIL-CANARY-[a-f0-9]{32}", prompt)
+        return match.group(0) if match else "unknown"
 
     adapter = MagicMock(spec=LLMAdapter)
     adapter.complete.side_effect = instant_correct
-    # Should fail because response is too fast (< 100ms)
-    assert IntegrityCheck.verify_model_capability(adapter) is False
+    assert IntegrityCheck.verify_model_capability(adapter) is True

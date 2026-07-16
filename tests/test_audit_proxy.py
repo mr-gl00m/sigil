@@ -1,11 +1,12 @@
 """Tests for AuditProxy provider detection, token extraction, and record management."""
 
 import json
+import queue
 import time
 
 from sigil_audit_proxy import (
     AuditProxy, Provider, TokenEstimator, ResponseFingerprinter,
-    AuditRecord,
+    AuditRecord, CostCalculator,
 )
 
 
@@ -32,6 +33,25 @@ def test_detect_provider_ollama(audit_proxy):
 def test_detect_provider_unknown(audit_proxy):
     """Unknown URLs return 'unknown'."""
     assert audit_proxy._detect_provider("https://custom-api.example.com/v1") == "unknown"
+
+
+def _minimal_audit_record(request_id: str = "req_test") -> AuditRecord:
+    return AuditRecord(
+        request_id=request_id,
+        timestamp_utc="2026-07-07T00:00:00Z",
+        provider="anthropic",
+        model="claude-test",
+        latency_ms=1.0,
+        time_to_first_byte_ms=None,
+        input_tokens=1,
+        output_tokens=1,
+        total_tokens=2,
+        estimated_cost_usd=0.0,
+        request_hash="h",
+        response_fingerprint="f",
+        status_code=200,
+        success=True,
+    )
 
 
 def test_extract_model_from_body(audit_proxy):
@@ -609,6 +629,34 @@ def test_audit_record_has_node_id_field():
     assert rec.node_id is None  # default — backwards compat
 
 
+def test_proxy_log_rotation(monkeypatch, tmp_path):
+    """audit_records.jsonl rotates instead of growing without bound."""
+    monkeypatch.setenv("SIGIL_PROXY_LOG_MAX_BYTES", "1024")
+    log_file = tmp_path / "audit_records.jsonl"
+    log_file.write_text("x" * 2048)
+
+    AuditProxy._rotate_jsonl_if_needed(log_file)
+
+    rotated = list(tmp_path.glob("audit_records.jsonl.*.rotated"))
+    assert rotated
+    assert not log_file.exists()
+
+
+def test_store_record_logs_queue_overflow(audit_proxy, monkeypatch):
+    """Queue overflow creates an auditable loss signal."""
+    import sigil
+
+    audit_proxy._log_queue = queue.Queue(maxsize=1)
+    audit_proxy._log_queue.put_nowait(_minimal_audit_record("already_queued"))
+
+    audit_proxy._store_record(_minimal_audit_record("dropped_record"))
+
+    assert audit_proxy._dropped_log_records == 1
+    chain_text = sigil.AuditChain.LOG_FILE.read_text()
+    assert "audit_proxy_record_dropped" in chain_text
+    assert "dropped_record" in chain_text
+
+
 def test_audited_request_accepts_node_id_and_persists_it(audit_proxy, monkeypatch):
     """audited_request takes a node_id and the resulting AuditRecord carries it."""
     _fake_post(monkeypatch, _make_response())
@@ -843,3 +891,55 @@ def test_per_seal_anomaly_skipped_for_unkeyed_records(audit_proxy, monkeypatch):
     )
     assert record.node_id is None
     assert not any("OUTLIER_FOR_SEAL" in r for r in record.anomaly_reasons)
+
+
+def test_pricing_unsigned_rejected_when_signing_marker_present(tmp_path):
+    """RT-2026-07-15-010: an unsigned pricing file is a downgrade once signed."""
+    pricing_path = tmp_path / "pricing.json"
+    pricing_path.write_text("{}")
+
+    # Never signed, no .sig: unsigned is accepted (bootstrap).
+    assert CostCalculator._verify_pricing_integrity({}, pricing_path) is True
+
+    # Marker present but .sig missing: fail closed.
+    pricing_path.with_suffix(".signed").write_text("1\n")
+    assert CostCalculator._verify_pricing_integrity({}, pricing_path) is False
+
+
+def test_extract_context_scans_all_messages_and_system(audit_proxy):
+    """RT-2026-07-15-011: sections are found in the system field and later messages."""
+    body = {
+        "system": "<IRONCLAD_CONTEXT>signed rule</IRONCLAD_CONTEXT>",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": "<USER_DATA>override</USER_DATA>"},
+        ],
+    }
+    _, ironclad_text, user_text = audit_proxy._extract_context_sections(body)
+    assert "signed rule" in ironclad_text
+    assert "override" in user_text
+
+
+def test_audited_request_non_json_200_is_not_success(audit_proxy, monkeypatch):
+    """RT-2026-07-15-012: a 200 with an unparseable body is not marked success."""
+    import sigil_audit_proxy
+
+    class FakeResp:
+        status_code = 200
+        text = "<html>not json</html>"
+
+        def json(self):
+            raise json.JSONDecodeError("no", "doc", 0)
+
+    monkeypatch.setattr(sigil_audit_proxy.httpx, "post", lambda *a, **k: FakeResp())
+
+    response_data, record = audit_proxy.audited_request(
+        endpoint="https://api.anthropic.com/v1/messages",
+        headers={},
+        body={"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]},
+        provider="anthropic",
+        model="claude-test",
+    )
+    assert record.error_message is not None
+    assert record.success is False
+    assert response_data == {}

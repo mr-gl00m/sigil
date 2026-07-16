@@ -32,7 +32,7 @@ import zipfile
 from urllib.parse import urlparse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 from pathlib import Path
 from enum import Enum
 from abc import ABC, abstractmethod
@@ -395,6 +395,16 @@ class CostCalculator:
         """
         sig_path = pricing_path.with_suffix('.sig')
         if not sig_path.exists():
+            # RT-2026-07-15-010: if this deployment has ever signed its pricing
+            # (marker present) but the .sig is now gone, treat the unsigned file
+            # as a downgrade and fail closed. _load_pricing then falls back to
+            # trusted defaults rather than an anomaly-suppressing tampered file.
+            if pricing_path.with_suffix('.signed').exists():
+                try:
+                    AuditChain.log("pricing_unsigned_rejected", {"path": str(pricing_path)})
+                except Exception:
+                    pass
+                return False
             try:
                 AuditChain.log("pricing_unsigned", {"path": str(pricing_path)})
             except Exception:
@@ -445,6 +455,9 @@ class CostCalculator:
             "signer_key_id": key_id,
             "key_name": key_name,
         }, indent=2))
+        # RT-2026-07-15-010: mark that this deployment signs its pricing so a
+        # later missing .sig is treated as a downgrade, not a bootstrap.
+        _atomic_write_text(pricing_path.with_suffix('.signed'), "1\n")
 
     @classmethod
     def _load_pricing(cls) -> Dict[str, Dict[str, Dict[str, float]]]:
@@ -600,6 +613,7 @@ class AuditProxy:
         self._records: collections.deque[AuditRecord] = collections.deque(maxlen=10000)
         self._lock = threading.Lock()
         self._request_counter = 0
+        self._dropped_log_records = 0
         self._log_queue: "queue.Queue[AuditRecord]" = queue.Queue(maxsize=1000)
         self._stop_event = threading.Event()
         # v1.7: per-seal anomaly baselines.
@@ -823,6 +837,7 @@ class AuditProxy:
 
             if self.log_to_file:
                 with FileLock(log_file):
+                    self._rotate_jsonl_if_needed(log_file)
                     # fsync after append so crash recovery sees the record
                     # on disk, not in the OS buffer (RT-2026-05-01-003).
                     with open(log_file, 'a') as f:
@@ -847,6 +862,24 @@ class AuditProxy:
                 )
 
             self._log_queue.task_done()
+
+    @staticmethod
+    def _max_proxy_log_bytes() -> int:
+        raw = os.getenv("SIGIL_PROXY_LOG_MAX_BYTES")
+        if raw:
+            try:
+                return max(1024, int(raw))
+            except ValueError:
+                pass
+        return 10 * 1024 * 1024
+
+    @classmethod
+    def _rotate_jsonl_if_needed(cls, log_file: Path) -> None:
+        if not log_file.exists() or log_file.stat().st_size <= cls._max_proxy_log_bytes():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        rotated = log_file.with_name(f"{log_file.name}.{stamp}.rotated")
+        os.replace(log_file, rotated)
 
     def shutdown(self, wait: bool = True):
         """Flush queued logs and stop the background logger."""
@@ -972,18 +1005,33 @@ class AuditProxy:
 
     def _extract_context_sections(self, body: Dict[str, Any]) -> Tuple[str, str, str]:
         """Pull out raw context, ironclad section, and user data for heuristics."""
-        context_text = ""
+        # RT-2026-07-15-011: scan the provider system field and every message,
+        # not just messages[0], so Anthropic (system is a separate top-level
+        # field) and multi-message bodies are covered.
+        parts_text = []
+        system_field = body.get("system")
+        if system_field:
+            parts_text.append(str(system_field))
         if "messages" in body and body.get("messages"):
-            msg = body["messages"][0]
-            context_text = msg.get("content", "") if isinstance(msg, dict) else ""
+            for msg in body["messages"]:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    parts_text.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            parts_text.append(str(block.get("text", "")))
         elif "prompt" in body:
-            context_text = str(body.get("prompt", ""))
+            parts_text.append(str(body.get("prompt", "")))
         elif "contents" in body:
             contents = body.get("contents", [])
             if contents and isinstance(contents[0], dict):
                 parts = contents[0].get("parts", [])
                 if parts and isinstance(parts[0], dict):
-                    context_text = str(parts[0].get("text", ""))
+                    parts_text.append(str(parts[0].get("text", "")))
+        context_text = "\n".join(p for p in parts_text if p)
 
         ironclad_text = ""
         user_text = ""
@@ -1267,7 +1315,11 @@ class AuditProxy:
             request_hash=request_hash,
             response_fingerprint=response_fingerprint,
             status_code=status_code,
-            success=200 <= status_code < 300,
+            # RT-2026-07-15-012: a 2xx status with a set error_message (for
+            # example a 200 with an unparseable body) is not a success. Keep
+            # success and error_message consistent so callers reading success
+            # are not handed an empty response_data as if it succeeded.
+            success=(200 <= status_code < 300) and error_message is None,
             error_message=error_message,
             request_preview=self._safe_request_preview(body),
             response_preview=self._safe_response_preview(
@@ -1428,7 +1480,7 @@ class AuditProxy:
             self._store_record(record)
 
     def run_canary(self, adapter: "LLMAdapter") -> bool:
-        """Execute a canary prompt to detect model swaps or hidden safety rewrites."""
+        """Check that the provider round trips an opaque canary unchanged."""
         success = IntegrityCheck.verify_model_capability(adapter)
         try:
             AuditChain.log("canary_check", {"success": success})
@@ -1445,8 +1497,20 @@ class AuditProxy:
         try:
             self._log_queue.put_nowait(record)
         except queue.Full:
-            import sys
-            print("[SIGIL WARN] Audit log queue full (1000). Record dropped.", file=sys.stderr)
+            self._dropped_log_records += 1
+            logger.warning(
+                "Audit log queue full (%s). Durable record dropped; total dropped=%s",
+                self._log_queue.maxsize,
+                self._dropped_log_records,
+            )
+            try:
+                AuditChain.log("audit_proxy_record_dropped", {
+                    "request_id": record.request_id,
+                    "drop_count": self._dropped_log_records,
+                    "queue_maxsize": self._log_queue.maxsize,
+                })
+            except (OSError, RuntimeError, ValueError):
+                pass
     
     def get_stats(
         self,
@@ -1574,6 +1638,8 @@ class AuditProxy:
 class LegalExporter:
     """Prepare tamper-evident discovery bundles for legal/regulatory use."""
 
+    _MANIFEST_SIGNATURE_DOMAIN = b"sigil-legal-manifest-v1\x00"
+
     @staticmethod
     def _hash_file(path: Path) -> str:
         digest = hashlib.sha256()
@@ -1583,11 +1649,31 @@ class LegalExporter:
         return digest.hexdigest()
 
     @staticmethod
+    def _sign_manifest(manifest: Dict[str, str]) -> Dict[str, str]:
+        """Sign the canonical file manifest with the SIGIL system key."""
+        canonical = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        manifest_hash = hashlib.sha256(canonical).hexdigest()
+        signer, signer_key_id = AuditChain._get_system_signer()
+        signature = signer.sign(
+            LegalExporter._MANIFEST_SIGNATURE_DOMAIN + manifest_hash.encode("ascii")
+        ).signature.hex()
+        return {
+            "algorithm": "Ed25519",
+            "domain": "sigil-legal-manifest-v1",
+            "manifest_hash": manifest_hash,
+            "signer_key_id": signer_key_id,
+            "signature": signature,
+        }
+
+    @staticmethod
     def create_discovery_package(
         time_range: Tuple[datetime, datetime],
         case_id: str,
         proxy: "AuditProxy",
         output_dir: Optional[Path] = None,
+        disclosure_fields: Optional[Sequence[str]] = None,
     ) -> Path:
         """
         Bundle logs, manifest, and summaries into a single zip for discovery.
@@ -1682,13 +1768,91 @@ class LegalExporter:
         ]
         _atomic_write_text(bundle_dir / "summary_report.txt", "\n".join(summary_lines))
 
+        # Selective receipt disclosures and their public verification material
+        from sigil import RuntimeManifest
+        from sigil_receipts import ReceiptStore
+
+        selected_fields = list(
+            disclosure_fields
+            or (
+                "receipt_type",
+                "issued_at",
+                "action_id",
+                "actor_id",
+                "action",
+                "decision",
+                "capability_id",
+                "effect_class",
+                "manifest_hash",
+                "assurance_profile",
+                "previous_receipt_id",
+                "parent_receipt_id",
+                "delegation_depth",
+            )
+        )
+        if "manifest_hash" not in selected_fields:
+            raise ValueError("Legal receipt disclosures must include manifest_hash")
+        if "previous_receipt_id" not in selected_fields:
+            raise ValueError(
+                "Legal receipt disclosures must include previous_receipt_id"
+            )
+        receipt_disclosures = []
+        runtime_manifests: Dict[str, Dict[str, Any]] = {}
+        for receipt in ReceiptStore.list():
+            issued_at = datetime.fromisoformat(
+                receipt["fields"]["issued_at"].replace("Z", "+00:00")
+            )
+            if start <= issued_at <= end:
+                disclosure = ReceiptStore.reveal(
+                    receipt["receipt_id"], selected_fields
+                )
+                receipt_disclosures.append(disclosure)
+                manifest_hash = receipt["fields"]["manifest_hash"]
+                runtime_manifests[manifest_hash] = RuntimeManifest.load(manifest_hash)
+        disclosure_bundle = {
+            "schema_id": "sigil.legal_receipt_bundle",
+            "schema_version": "0.1",
+            "case_id": case_id,
+            "disclosures": receipt_disclosures,
+            "runtime_manifests": runtime_manifests,
+            "trust_bundle": ReceiptStore.trust_bundle()
+            if receipt_disclosures
+            else None,
+        }
+        _atomic_write_text(
+            bundle_dir / "receipt_disclosures.json",
+            json.dumps(disclosure_bundle, indent=2, sort_keys=True),
+        )
+
         # Manifest for tamper-evidence
         manifest = {}
         for path in bundle_dir.iterdir():
             if path.is_file():
                 manifest[path.name] = LegalExporter._hash_file(path)
         manifest_path = bundle_dir / "sha256_manifest.json"
-        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
+        manifest_text = json.dumps(manifest, indent=2, sort_keys=True)
+        manifest_bytes = manifest_text.encode()
+        _atomic_write_text(manifest_path, manifest_text)
+
+        signer, signer_key_id = AuditChain._get_system_signer()
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        signature_receipt = {
+            "schema_version": 1,
+            "algorithm": "Ed25519",
+            "signed_file": manifest_path.name,
+            "signer_key_id": signer_key_id,
+            "manifest_sha256": manifest_digest,
+            "signature": signer.sign(manifest_bytes).signature.hex(),
+        }
+        _atomic_write_text(
+            bundle_dir / "manifest_signature.json",
+            json.dumps(signature_receipt, indent=2, sort_keys=True),
+        )
+        AuditChain.log("legal_export_manifest_signed", {
+            "case_id": case_id,
+            "manifest_sha256": manifest_digest,
+            "signer_key_id": signer_key_id,
+        })
 
         # Zip it
         zip_path = bundle_dir.with_suffix(".zip")
@@ -1737,41 +1901,29 @@ class AuditedAdapter:
 
 
 class IntegrityCheck:
-    """Canary to verify model identity and honesty using randomized challenges."""
+    """Randomized round-trip check for prompt or response rewriting."""
 
     # Static hash kept for provenance checks only
     EXPECTED_HASH = hashlib.sha256(b"SIGIL").hexdigest()
 
     @classmethod
     def verify_model_capability(cls, adapter: "LLMAdapter") -> bool:
-        # Generate a random challenge each time to prevent caching/replay
-        challenge = os.urandom(16).hex()
-        expected = hashlib.sha256(challenge.encode()).hexdigest()
-        prompt = f"Reply with ONLY the SHA256 hash of the exact string '{challenge}'. No other text."
+        challenge = f"SIGIL-CANARY-{os.urandom(16).hex()}"
+        prompt = f"Reply with only this exact token: {challenge}"
 
         try:
-            start = time.time()
             response = adapter.complete(prompt, max_tokens=128)
-            elapsed = time.time() - start
         except Exception as exc:
             AuditChain.log("integrity_check_error", {"error": str(exc)})
             return False
 
-        normalized = response.strip().lower()
-        hash_match = expected in normalized or expected[:16] in normalized
-
-        # Timing plausibility: a real model inference should take >100ms
-        timing_plausible = elapsed > 0.1
-
-        success = hash_match and timing_plausible
+        observed = response.strip()
+        success = observed == challenge
 
         AuditChain.log("integrity_check", {
-            "challenge": challenge,
-            "expected": expected,
-            "observed_fragment": normalized[:64],
-            "hash_match": hash_match,
-            "elapsed_seconds": round(elapsed, 3),
-            "timing_plausible": timing_plausible,
+            "challenge_sha256": hashlib.sha256(challenge.encode()).hexdigest(),
+            "observed_fragment": observed[:64],
+            "exact_echo": success,
             "success": success,
         })
 

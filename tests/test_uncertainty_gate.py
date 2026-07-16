@@ -126,6 +126,25 @@ def test_single_response_passes():
     assert result.confidence_score == 1.0
 
 
+def test_partial_generation_failure_fails_closed():
+    adapter = _make_mock_adapter([
+        "Only successful sample.",
+        Exception("provider timeout"),
+        Exception("provider timeout"),
+    ])
+    gate = UncertaintyGate(
+        adapter,
+        k_samples=3,
+        embedding_client=_FakeEmbeddingClient(),
+    )
+
+    result = gate.robust_generate("test")
+
+    assert result.is_consistent is False
+    assert result.confidence_score == 0.0
+    assert result.primary_response == ""
+
+
 def test_embedding_failure_fails_closed():
     """v1.7: if the embedding service is unreachable, UncertaintyGate
     must fail closed (treat as inconsistent + abstain). The earlier

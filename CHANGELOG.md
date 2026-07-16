@@ -7,21 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-16
+
+### Highlights
+
+- Portable Ed25519 proof-of-execution receipts bind actions, decisions, delegation, and MCP calls
+  to signed runtime manifests.
+- The independent `sigil-verify` command checks receipts, disclosures, chains, and legal bundles
+  with caller-pinned trust anchors.
+- Legal discovery exports now carry selective receipt proofs and a signed file manifest.
+
+### Added
+
+- `RECEIPT_SPEC.md` v0.1 defines canonical JSON, signed runtime manifests, salted Merkle field
+  commitments, receipt chains, delegation links, selective disclosure, and the software-only
+  assurance boundary.
+- `RuntimeManifest` signs SHA-256 measurements of every shipped source module, `pyproject.toml`,
+  active public key IDs, and the SIGIL version. New audit entries and validator results bind to
+  its manifest hash.
+- `sigil_receipts.py` adds a dedicated Ed25519 receipt signer, fail-closed append-only store,
+  portable action receipts, trust bundles, delegation-aware emission, and field disclosure
+  proofs.
+- `sigil-verify` verifies receipt signatures, receipt chains, delegation links, runtime manifest
+  binding, and selective disclosures without importing producer modules.
+- `sigil_mcp.MCPTrustWrapper` provides the stdio MCP reference path with sealed capability
+  resolution, Sentinel verification, effect gating, pinned tool definitions, durable
+  preauthorization, and terminal receipts.
+- Legal discovery packages now include selective receipt bundles and a signed file manifest.
+- `python sigil.py --version` prints `SIGIL <version>` and exits. SECURITY.md has instructed reporters to include this output since v1.8.0, but the flag did not exist; the CLI rejected it with an argparse error.
+
+### Changed
+
+- `IntegrityReceipt` is described as a prompt-conditioning canary and now binds its HMAC token to
+  the signed runtime manifest. Action receipts use the separate `sigil_receipts` API and key.
+- AuditChain documentation now calls the structure a signed linear hash chain. Merkle terminology
+  is reserved for the new receipt field commitments.
+- `AuditProxy.run_canary()` now uses a randomized echo challenge and documents its request-path
+  scope without claiming model identity attestation.
+- Python 3.9 is the minimum supported runtime, matching the built-in generic annotations used by
+  the shipped modules.
+
+### Migration from 1.8.0
+
+- Pass a runtime manifest and pinned system verification key to `verify_receipt()`. When a
+  disclosure includes `manifest_hash`, pass the same trust material to `verify_disclosure()`.
+- Pass `--receipt-key` and `--system-key` when verifying a legal receipt bundle. Embedded bundle
+  keys remain portable metadata and no longer act as trust anchors.
+- Upgrade Python 3.8 environments to Python 3.9 or newer before installing 1.9.0.
+
+### Fixed
+
+- Standalone disclosure verification accepts spec-conformant disclosures that omit
+  `manifest_hash` and reports runtime binding as unverified.
+- `UncertaintyGate` abstains when any requested sample fails instead of assigning full confidence
+  to an incomplete sample set.
+- Validated tool execution rechecks capability resolution, parameter constraints, effect class,
+  and escalation at dispatch time.
+- Loyalty analysis scans the full conversation and system field. Audited backend failures retain
+  a consistent error result.
+- The integrity canary uses an achievable randomized echo challenge.
+
+### Security
+
+- Legal bundle verification requires receipt and system keys supplied out of band. Producer-carried
+  keys cannot self-anchor a forged bundle. Bundle disclosures must carry a complete, adjacent
+  receipt-chain proof and an exact signed envelope.
+- Receipt and disclosure verification require signed runtime-manifest binding whenever a manifest
+  hash is claimed.
+- Key succession requires a pinned archived verifier, a valid old-key signature, and a chain that
+  terminates at the active key.
+- Strict audit verification rejects unsigned rewrites even after the system public key is deleted,
+  and rejects legacy 128-bit entry hashes.
+- Receipt append operations verify the stored chain, signatures, delegation links, and runtime
+  manifest bindings before accepting a new record.
+- Plaintext encrypted-state downgrades are rejected unless the caller explicitly requests a
+  one-time migration.
+- Legal export file manifests are Ed25519-signed. Pricing configuration fails closed after a
+  signing marker exists.
+- Receipt-chain verification explicitly rejects self-parent delegation.
+- The MCP wrapper re-verifies seals before every effect, blocks HumanGate escalations, bounds stdio
+  reads before allocation, and records an `outcome_unknown` receipt when a dispatched result cannot
+  be represented canonically.
+- The standalone verifier applies bounded reads to input files and manifest directories.
+
 ## [1.8.0] - 2026-06-08
 
-Security-hardening release. Seven RT-2026-05-29 findings closed; four are caller-visible behavior changes (redaction scope, oversize-input handling, `keygen --force`, dependency ranges). No new features. Test suite: 420 passing, 2 skipped — no previously-green test went red.
+Security-hardening release. Seven RT-2026-05-29 findings closed; four are caller-visible behavior changes (redaction scope, oversize-input handling, `keygen --force`, dependency ranges). No new features. Test suite: 420 passing, 2 skipped, no previously-green test went red.
 
 ### Security
 
 - **Redaction now catches space-separated and unlabeled credential values (RT-2026-05-29-001).** `_redact_body` previously missed multi-token secrets like `Bearer <token>` and bare provider tokens. It now redacts `Bearer <token>` forms and unlabeled provider tokens (`sk-…`, `gh[pousr]_…`, `AIza…`).
 - **`conversation_history` now runs through `InputNormalizer` (RT-2026-05-29-002).** Prior versions only HTML-escaped history entries, so an encoded payload (base64 / hex / ROT13) planted in conversation history bypassed the normalization applied to live user input. History is now normalized the same way as fresh input.
 - **Oversize input is truncated-then-scanned instead of passed through (RT-2026-05-29-003).** Input above `SIGIL_NORMALIZE_MAX_BYTES` previously short-circuited and returned verbatim, so a payload hidden past the cap reached the model unscanned. It is now truncated to the cap and scanned; the dropped tail cannot reach the model.
-- **Corrupt `revoked.json` fails closed (RT-2026-05-29-004).** A garbled CRL previously crashed seal verification with a raw traceback (DoS). It now sets an internal unreadable flag and `verify()` rejects every seal with `CRL_UNREADABLE`, logging the parse error to the audit chain. Deliberately fails closed rather than treating the CRL as empty — the "empty" path would have silently un-revoked every seal.
+- **Corrupt `revoked.json` fails closed (RT-2026-05-29-004).** A garbled CRL previously crashed seal verification with a raw traceback (DoS). It now sets an internal unreadable flag and `verify()` rejects every seal with `CRL_UNREADABLE`, logging the parse error to the audit chain. Deliberately fails closed rather than treating the CRL as empty; the "empty" path would have silently un-revoked every seal.
 - **`keygen --force` archives and confirms before overwriting (RT-2026-05-29-007).** Interactive `keygen --force` on an existing key now warns, requires the operator to type the key name, and archives the old keypair to `<name>.{key,pub}.bak.<ts>` before writing. Programmatic `Keyring.generate(force=True)` is unchanged.
 
 ### Changed
 
-- **`_redact_body` redacts more aggressively (RT-2026-05-29-001).** Multi-token and unlabeled provider tokens are now caught. Legitimate audit context following a credential value on the same line may also be redacted. Over-redaction loses log detail; under-redaction leaks secrets — this errs toward the former.
+- **`_redact_body` redacts more aggressively (RT-2026-05-29-001).** Multi-token and unlabeled provider tokens are now caught. Legitimate audit context following a credential value on the same line may also be redacted. Over-redaction loses log detail; under-redaction leaks secrets; this errs toward the former.
 - **`InputNormalizer.normalize` no longer returns oversize input verbatim (RT-2026-05-29-003).** Direct callers that relied on oversize passthrough now receive truncated output. `build_context` is unaffected (it already truncates to `max_input_length` first).
 - **Dependency ranges gained upper bounds (RT-2026-05-29-006).** `pynacl>=1.5,<2`, `httpx>=0.25,<1`, `python-dotenv>=1.0,<2`, `tiktoken>=0.7,<1`, `pytest>=7.0,<10`. A `pip install sigil-security` that skips `requirements-lock.txt` can no longer silently pull a breaking or compromised next major into the crypto path. Locked versions all satisfy the new ranges; `requirements-lock.txt` remains the reproducible-install source of truth.
 
@@ -64,24 +147,24 @@ If your environment requires a newer major of any dependency, the loosened range
 
 ### Added
 
-- `IntegrityReceipt` class — HMAC-based proof-of-conditioning per request. `embed(seal) -> (nonce, canary, block_string)` and `verify(seal, context, response) -> (bool, reason)`.
-- `EmbeddingClient` class — thin Ollama `/api/embeddings` client backing the new `UncertaintyGate`. Honors `OLLAMA_ALLOW_REMOTE`, `verify_tls`, `ca_bundle`, and writes per-call audit-chain entries.
-- `_PerSealAnomalyTracker` — rolling-window statistical anomaly detection per `SigilSeal.node_id`. Fires `*_OUTLIER_FOR_SEAL` reasons when a record is ≥3σ off the seal's own baseline.
-- `ToolRegistry.execute_validated(seal, invocation)` — supported dispatch path for capability-bearing seals. Re-verifies that `seal.capabilities[capability_id]` matches `invocation.resolved_tool` before running.
-- `requirements-lock.txt` — pinned application install lockfile for reproducible builds.
+- `IntegrityReceipt` class: HMAC-based proof-of-conditioning per request. `embed(seal) -> (nonce, canary, block_string)` and `verify(seal, context, response) -> (bool, reason)`.
+- `EmbeddingClient` class: thin Ollama `/api/embeddings` client backing the new `UncertaintyGate`. Honors `OLLAMA_ALLOW_REMOTE`, `verify_tls`, `ca_bundle`, and writes per-call audit-chain entries.
+- `_PerSealAnomalyTracker`: rolling-window statistical anomaly detection per `SigilSeal.node_id`. Fires `*_OUTLIER_FOR_SEAL` reasons when a record is ≥3σ off the seal's own baseline.
+- `ToolRegistry.execute_validated(seal, invocation)`: supported dispatch path for capability-bearing seals. Re-verifies that `seal.capabilities[capability_id]` matches `invocation.resolved_tool` before running.
+- `requirements-lock.txt`: pinned application install lockfile for reproducible builds.
 - `node_id` and `integrity_receipt_verified` fields on `AuditRecord`.
 - New operator knobs (env var or kwarg, see README): `OLLAMA_ALLOW_REMOTE`, `SIGIL_PROMPT_BUNDLE_MAX_BYTES`, `SIGIL_NORMALIZE_MAX_BYTES`, `SIGIL_PER_SEAL_TRACKER_MAX`, `OLLAMA_TIMEOUT_SECONDS`, `verify_tls` / `ca_bundle` on `EmbeddingClient`, `verify` / `node_id` / `seal` / `prompt_context` on `AuditProxy.audited_request`, `allow_remote` / `verify_tls` / `ca_bundle` on `OllamaAdapter`, `stream_capture_cap` on `AuditProxy`.
 
 ### Changed
 
-- **Breaking: `InputNormalizer.normalize` now redacts encoded payloads instead of decoding them into the prompt.** Previously, detected base64 / hex / ROT13 / URL / UTF-7 payloads were decoded and returned with a `[DECODED_PAYLOAD]` prefix — that did the attacker's first-stage work. The new behavior replaces each encoded slice with `[REDACTED-BASE64-{hash}]`-style markers and logs the original + decoded form to `AuditChain` (`input_payload_redacted` event). The model never sees the decoded payload. Callers that depended on `normalize()` returning decoded text will see a redaction marker instead. Slices that don't decode as printable UTF-8 (binary hashes, file signatures) are preserved.
+- **Breaking: `InputNormalizer.normalize` now redacts encoded payloads instead of decoding them into the prompt.** Previously, detected base64 / hex / ROT13 / URL / UTF-7 payloads were decoded and returned with a `[DECODED_PAYLOAD]` prefix; that did the attacker's first-stage work. The new behavior replaces each encoded slice with `[REDACTED-BASE64-{hash}]`-style markers and logs the original + decoded form to `AuditChain` (`input_payload_redacted` event). The model never sees the decoded payload. Callers that depended on `normalize()` returning decoded text will see a redaction marker instead. Slices that don't decode as printable UTF-8 (binary hashes, file signatures) are preserved.
 - **Breaking: `ToolRegistry.execute(tool_name, seal)` refuses capability-bearing seals.** A seal with non-empty `capabilities` map now rejects the raw-tool-name path with `PermissionError`. Use `SigilRuntime.validate_and_execute` → `ToolRegistry.execute_validated(seal, invocation)`. Legacy seals (no `capabilities` map) keep working unchanged.
 - **Breaking: `UncertaintyGate` similarity metric switched from Jaccard to embedding cosine.** Default `consistency_threshold` raised 0.6 → 0.7 to match the cosine scale. Constructing the gate requires a reachable Ollama instance unless an `embedding_client=` is injected (tests). Fails closed with `EmbeddingError` rather than silently falling back.
 - **Breaking: `HumanGate.approve` and `check_approval` reject `state_id` values that don't match `^[a-f0-9]{24}$`** (the shape `request_approval` produces). Closes a path-traversal where `state_id="../tmp/foo"` could write encrypted state outside `STATE_DIR`.
 - **Breaking: `AuditChain.verify_chain` fails closed when signed entries exist but `_system.pub` is missing or unreadable.** Earlier versions skipped signature enforcement and reported success.
-- **Breaking: empty `SigilSeal.allowed_tools` denies all tools.** Previously treated as "all tools allowed" — inverted to match `allowed_effects` deny-by-default semantics.
+- **Breaking: empty `SigilSeal.allowed_tools` denies all tools.** Previously treated as "all tools allowed"; inverted to match `allowed_effects` deny-by-default semantics.
 - **`OllamaAdapter` refuses non-localhost `base_url` unless `OLLAMA_ALLOW_REMOTE=1` env var or `allow_remote=True` constructor arg is set.** Each remote opt-in is logged to `AuditChain` for forensic traceability.
-- `AuditProxy.audited_request` enforces an explicit `(scheme, host)` allowlist for outbound HTTP — refuses URLs outside the four documented provider hosts before `httpx.post`.
+- `AuditProxy.audited_request` enforces an explicit `(scheme, host)` allowlist for outbound HTTP; refuses URLs outside the four documented provider hosts before `httpx.post`.
 - Every state-writing path uses atomic writes (tmp file + `fsync` + `os.replace`): keys, encrypted state, CRL, pending approvals, succession records, key pin file, archive copies, system keypair bootstrap, pricing signature, audit exports, CLI sign output, compliance report.
 - `IntegrityReceipt` canary widened from 64-bit to 128-bit truncation (16 → 32 hex characters).
 - `IntegrityReceipt` HMAC key is now a domain-separated subkey derived via SHA-256, not the raw Ed25519 signing-key bytes.
@@ -119,19 +202,19 @@ If you relied on the decoded form for downstream processing, read it from the au
 # v1.6.1
 result = tools.execute("transfer_money", seal, amount=100)
 
-# v1.7.0 — for seals with seal.capabilities populated
+# v1.7.0: for seals with seal.capabilities populated
 result = runtime.validate_and_execute(node_id, user_input, [proposed_invocation])
 for inv in result["validated_invocations"]:
     tools.execute_validated(seal, ToolInvocation(**inv), **inv["parameters"])
 
-# Legacy seals (empty seal.capabilities) — no change required
+# Legacy seals (empty seal.capabilities): no change required
 result = tools.execute("legacy_tool", seal)  # still works
 ```
 
 **3. `UncertaintyGate` requires a reachable Ollama instance.**
 
 ```python
-# v1.7.0 default — requires Ollama at http://localhost:11434 with
+# v1.7.0 default: requires Ollama at http://localhost:11434 with
 # nomic-embed-text loaded.
 gate = UncertaintyGate(adapter, k_samples=3)
 
@@ -146,15 +229,15 @@ gate = UncertaintyGate(
 gate = UncertaintyGate(adapter, embedding_client=fake_client)
 ```
 
-If you cannot run Ollama, `UncertaintyGate` is not currently usable — opt out at the architecture level rather than running a known-broken Jaccard implementation. The v1.6.1 behavior is gone.
+If you cannot run Ollama, `UncertaintyGate` is not currently usable; opt out at the architecture level rather than running a known-broken Jaccard implementation. The v1.6.1 behavior is gone.
 
 **4. State IDs must be 24-character hex.**
 
 ```python
-# v1.6.1 — accepted any string
+# v1.6.1: accepted any string
 HumanGate.approve("any_arbitrary_string")
 
-# v1.7.0 — must match request_approval shape
+# v1.7.0: must match request_approval shape
 HumanGate.approve("a1b2c3d4e5f6a1b2c3d4e5f6")  # 24 hex chars
 HumanGate.approve("../tmp/exploit")           # raises ValueError
 ```
@@ -168,11 +251,11 @@ If your tooling depended on `verify_chain()` succeeding when `_system.pub` was m
 **6. Empty `allowed_tools` denies, doesn't permit.**
 
 ```python
-# v1.6.1 — empty list meant "all tools allowed"
+# v1.6.1: empty list meant "all tools allowed"
 seal = SigilSeal(node_id="x", instruction="...", allowed_tools=[])
 tools.execute("any_tool", seal)  # ran
 
-# v1.7.0 — empty list denies everything
+# v1.7.0: empty list denies everything
 tools.execute("any_tool", seal)  # raises PermissionError
 ```
 
@@ -182,8 +265,8 @@ Audit your existing seals: an empty `allowed_tools` was probably unintentional. 
 
 - Power-loss safety on every state-writing path (RT-2026-05-01-003 + RT-2026-05-04-001 + B-001 + B-006 sweep): keys, encrypted state, CRL, pending approvals, succession records, pin file, archive copies, system keypair bootstrap, pricing signature, audit exports, CLI sign output, compliance report.
 - DoS prevention: CLI prompt bundles capped at 4 MiB, streaming capture at 256 KiB, `InputNormalizer` input at 1 MiB, per-seal anomaly tracker memory at 1000 LRU entries.
-- `InputNormalizer` no longer over-redacts non-decoding base64/hex slices — legitimate hashes and signatures survive when an attack payload is detected nearby.
-- `EmbeddingClient.embed` writes per-call audit-chain entries (host, model, text length, SHA-256 of text — never raw text).
+- `InputNormalizer` no longer over-redacts non-decoding base64/hex slices; legitimate hashes and signatures survive when an attack payload is detected nearby.
+- `EmbeddingClient.embed` writes per-call audit-chain entries (host, model, text length, SHA-256 of text; never raw text).
 - `EmbeddingClient` honors `verify_tls` / `ca_bundle` for internal-CA-signed Ollama deployments.
 - `AuditRecord.integrity_receipt_verified` is auto-populated by `AuditProxy.audited_request` when `seal` and `prompt_context` are passed (closes the v1.7 plumbing gap).
 - `AuditProxy.audited_request` honors the calling adapter's `verify_tls` / `ca_bundle` setting on the audited path (previously dropped silently).
@@ -208,11 +291,11 @@ Audit your existing seals: an empty `allowed_tools` was probably unintentional. 
 
 ## [1.6.1] - 2026-04-28
 
-> **Note on versioning.** The previous version on the GitHub remote is `v1.6.0`. Local working-tree development continued from `v1.5.0`, and the changes documented in the [1.5.0] entry below are included in `v1.6.1` as well. The `v1.6.0` release on GitHub does not have a corresponding entry in this CHANGELOG yet — its release notes live on the GitHub Releases page and will be reconciled into this file when the local working tree is fetched against the remote.
+> **Note on versioning.** The previous version on the GitHub remote is `v1.6.0`. Local working-tree development continued from `v1.5.0`, and the changes documented in the [1.5.0] entry below are included in `v1.6.1` as well. The `v1.6.0` release on GitHub does not have a corresponding entry in this CHANGELOG yet; its release notes live on the GitHub Releases page and will be reconciled into this file when the local working tree is fetched against the remote.
 
 ### License migration: CC0 → MIT
 
-The repo previously carried a CC0 LICENSE file but described itself as MIT in the pitch documents — a contradiction that read as legal carelessness on first contact. Settling on MIT and propagating it across every reference: `LICENSE`, README badge, README footer, `CONTRIBUTING.md`, source-file headers in `sigil.py` / `sigil_audit_proxy.py` / `sigil_llm_adapter.py`, the demo banner, and historical release-notes footers. Existing CC0 grants for code published under prior tags remain valid for what was distributed at the time.
+The repo previously carried a CC0 LICENSE file but described itself as MIT in the pitch documents, a contradiction that read as legal carelessness on first contact. Settling on MIT and propagating it across every reference: `LICENSE`, README badge, README footer, `CONTRIBUTING.md`, source-file headers in `sigil.py` / `sigil_audit_proxy.py` / `sigil_llm_adapter.py`, the demo banner, and historical release-notes footers. Existing CC0 grants for code published under prior tags remain valid for what was distributed at the time.
 
 ### Documentation honesty
 
@@ -222,8 +305,8 @@ The repo previously carried a CC0 LICENSE file but described itself as MIT in th
 ### Project hygiene
 
 - **`SECURITY.md`** added with a responsible-disclosure process, contact email, and response-time targets.
-- **`pyproject.toml`** added — `pip install sigil-security` will work after the first PyPI upload. Optional dependency groups: `[llm]` for `httpx` + `python-dotenv`, `[tokens]` for `tiktoken`, `[all]` for both, `[dev]` for the test suite.
-- **GitHub Actions CI** added at `.github/workflows/ci.yml` — runs pytest on Python 3.10/3.11/3.12 across Ubuntu and Windows, plus a `python -m build` + `twine check` pass on every push and PR. README now carries a CI status badge.
+- **`pyproject.toml`** added; `pip install sigil-security` will work after the first PyPI upload. Optional dependency groups: `[llm]` for `httpx` + `python-dotenv`, `[tokens]` for `tiktoken`, `[all]` for both, `[dev]` for the test suite.
+- **GitHub Actions CI** added at `.github/workflows/ci.yml`; runs pytest on Python 3.10/3.11/3.12 across Ubuntu and Windows, plus a `python -m build` + `twine check` pass on every push and PR. README now carries a CI status badge.
 - **`_cli_entry()`** added to `sigil.py` so the `sigil` console script (registered in `pyproject.toml`) reproduces the existing `__main__` dispatch (no-args → demo, args → cli).
 - **Project website** added at `docs/index.html` (single-file HTML, no JS, no external dependencies, dark theme matching the project ethos). `docs/.nojekyll` opts out of Jekyll so the custom HTML renders as-is. To deploy: GitHub repo → Settings → Pages → Source: "Deploy from a branch" → Branch: `main` / `/docs`. Custom domain (e.g. `sigil.security`, `sigil-project.org`) goes in the same settings page once registered. Site content adapted from the Document 1 overview, with install instructions, the seven design commitments, the limitations section, and the same self-conducted-review honesty as the pitch documents.
 
@@ -238,23 +321,23 @@ The repo previously carried a CC0 LICENSE file but described itself as MIT in th
 
 ### Security Hardening via Leaked Codebase Cross-Reference
 
-A security analysis of a recently leaked agentic AI codebase cataloged 14 vulnerability classes (SEC-01 through SEC-14). We cross-referenced every finding against SIGIL's attack surface — 4 required patches, 8 were already mitigated, 2 were not applicable.
+A security analysis of a recently leaked agentic AI codebase cataloged 14 vulnerability classes (SEC-01 through SEC-14). We cross-referenced every finding against SIGIL's attack surface: 4 required patches, 8 were already mitigated, 2 were not applicable.
 
 Full analysis in [report.md](report.md). Detailed release notes in [RELEASE_NOTES_v1.5.0.md](release/RELEASE_NOTES_v1.5.0.md).
 
 #### Fixed (CRITICAL severity)
 
-- **Encrypted State Files at Rest** — HumanGate state files (`pending_*.json`, `attempts_*.json`, `executed_nonces.json`) now encrypted with XSalsa20-Poly1305 using a key derived from the system signing key. Files set to `0o600` permissions. Legacy plaintext files auto-migrated on first read. (SEC-01)
-- **Embedded Encoding Payload Detection** — `InputNormalizer` Base64/Hex patterns no longer use anchored regexes. Two-phase detection: whole-string fast path plus `finditer()`-based embedded payload scanning catches encoded payloads within natural language. Recursive normalization handles multi-layer (Matryoshka) encodings. (SEC-12)
+- **Encrypted State Files at Rest**: HumanGate state files (`pending_*.json`, `attempts_*.json`, `executed_nonces.json`) now encrypted with XSalsa20-Poly1305 using a key derived from the system signing key. Files set to `0o600` permissions. Legacy plaintext files auto-migrated on first read. (SEC-01)
+- **Embedded Encoding Payload Detection**: `InputNormalizer` Base64/Hex patterns no longer use anchored regexes. Two-phase detection: whole-string fast path plus `finditer()`-based embedded payload scanning catches encoded payloads within natural language. Recursive normalization handles multi-layer (Matryoshka) encodings. (SEC-12)
 
 #### Fixed (HIGH severity)
 
-- **FileLock on State File Writes** — `HumanGate._record_attempt()`, `request_approval()`, and `approve()` now wrapped in `FileLock` blocks, preventing concurrent-write corruption of lockout counters and approval signatures. (SEC-10)
-- **Bounded Audit Proxy Queue** — `AuditProxy._log_queue` set to `maxsize=1000` with `put_nowait()` and stderr warning on overflow. Prevents unbounded memory growth under high load or flooding attacks. (SEC-04)
+- **FileLock on State File Writes**: `HumanGate._record_attempt()`, `request_approval()`, and `approve()` now wrapped in `FileLock` blocks, preventing concurrent-write corruption of lockout counters and approval signatures. (SEC-10)
+- **Bounded Audit Proxy Queue**: `AuditProxy._log_queue` set to `maxsize=1000` with `put_nowait()` and stderr warning on overflow. Prevents unbounded memory growth under high load or flooding attacks. (SEC-04)
 
 #### Fixed (MEDIUM severity)
 
-- **File Permissions on Sensitive Files** — `_write_encrypted_state()` and `AuditChain.log()` now call `chmod(0o600)` after writes. Gracefully handles Windows via `try/except (OSError, NotImplementedError)`. (SEC-01)
+- **File Permissions on Sensitive Files**: `_write_encrypted_state()` and `AuditChain.log()` now call `chmod(0o600)` after writes. Gracefully handles Windows via `try/except (OSError, NotImplementedError)`. (SEC-01)
 
 ### Test Results
 
@@ -266,34 +349,34 @@ Full analysis in [report.md](report.md). Detailed release notes in [RELEASE_NOTE
 
 ### Deterministic Validator Gate
 
-Prior SIGIL releases hardened the _audit and forensic_ layer — signing prompts, verifying chains, detecting encoding attacks. But the core execution path still relied on LLM cooperation: the model decided which tools to call and with what arguments, and SIGIL could only log what happened afterward.
+Prior SIGIL releases hardened the _audit and forensic_ layer: signing prompts, verifying chains, detecting encoding attacks. But the core execution path still relied on LLM cooperation: the model decided which tools to call and with what arguments, and SIGIL could only log what happened afterward.
 
-v1.4.0 introduces a **deterministic validator gate** that sits between LLM output and tool execution. The LLM can no longer name tools directly. It emits opaque capability IDs, and the Validator — running ordinary code, not AI — resolves, constrains, and authorizes every invocation before the executor sees it. This is the architectural change SIGIL needed to move from _"we'll catch it in the audit"_ to _"it can't happen."_
+v1.4.0 introduces a **deterministic validator gate** that sits between LLM output and tool execution. The LLM can no longer name tools directly. It emits opaque capability IDs, and the Validator (ordinary code, not AI) resolves, constrains, and authorizes every invocation before the executor sees it. This is the architectural change SIGIL needed to move from _"we'll catch it in the audit"_ to _"it can't happen."_
 
 Motivation and architectural analysis documented in [RELEASE_NOTES_v1.4.0.md](release/RELEASE_NOTES_v1.4.0.md).
 
 ### Added
 
-- **`EffectClass` enum** — Five effect classes (`READ`, `WRITE`, `NETWORK`, `EXEC`, `PRIVILEGED`) for deny-by-default capability enforcement. `high_impact()` classmethod identifies classes that may require escalation.
-- **Capability ID minting** — `Architect.seal()` mints opaque capability IDs (`cap_{sha256(node_id:tool_name:nonce)[:12]}`) for each allowed tool. The LLM never sees real tool names; only the Validator can resolve IDs back to tools.
-- **Seal-level parameter constraints** — `SigilSeal.parameter_constraints` defines per-capability JSON-Schema-subset constraints (type, min, max, minLength, maxLength, pattern, enum). Constraints are signature-covered — tampering invalidates the seal.
-- **Seal-level output schema** — `SigilSeal.output_schema` defines the expected structure of LLM output (JSON Schema subset: type, properties, required, additionalProperties, maxItems, items). Also signature-covered.
-- **Seal-level effect declarations** — `SigilSeal.allowed_effects` and `SigilSeal.escalate_effects` declare which effect classes a workflow step permits, and which require human gate approval even after validation.
-- **`Validator` class** — Deterministic validation engine (~200 lines) with:
-  - `validate_invocation()` — resolves capability ID → tool name, validates parameters against constraints, checks effect class against allowed list
-  - `validate_output()` — validates LLM output structure against output schema
-  - `check_escalation()` — determines if an invocation's effect class requires human gate approval
-  - `register_tool_effect()` / `get_tool_effect()` — effect class registry (unregistered tools default to `PRIVILEGED`)
-- **`ToolInvocation` dataclass** — Structured representation of a proposed tool call: `capability_id`, `parameters`, `resolved_tool` (filled by validation), `effect_class` (filled by validation).
-- **`SigilRuntime.validate_and_execute()`** — Mandatory gate method that chains seal verification → invocation validation → output validation → effect escalation. Returns validated invocations with resolved tools, escalation approvals, and output validation status.
+- **`EffectClass` enum**: Five effect classes (`READ`, `WRITE`, `NETWORK`, `EXEC`, `PRIVILEGED`) for deny-by-default capability enforcement. `high_impact()` classmethod identifies classes that may require escalation.
+- **Capability ID minting**: `Architect.seal()` mints opaque capability IDs (`cap_{sha256(node_id:tool_name:nonce)[:12]}`) for each allowed tool. The LLM never sees real tool names; only the Validator can resolve IDs back to tools.
+- **Seal-level parameter constraints**: `SigilSeal.parameter_constraints` defines per-capability JSON-Schema-subset constraints (type, min, max, minLength, maxLength, pattern, enum). Constraints are signature-covered; tampering invalidates the seal.
+- **Seal-level output schema**: `SigilSeal.output_schema` defines the expected structure of LLM output (JSON Schema subset: type, properties, required, additionalProperties, maxItems, items). Also signature-covered.
+- **Seal-level effect declarations**: `SigilSeal.allowed_effects` and `SigilSeal.escalate_effects` declare which effect classes a workflow step permits, and which require human gate approval even after validation.
+- **`Validator` class**: Deterministic validation engine (~200 lines) with:
+  - `validate_invocation()`: resolves capability ID → tool name, validates parameters against constraints, checks effect class against allowed list
+  - `validate_output()`: validates LLM output structure against output schema
+  - `check_escalation()`: determines if an invocation's effect class requires human gate approval
+  - `register_tool_effect()` / `get_tool_effect()`: effect class registry (unregistered tools default to `PRIVILEGED`)
+- **`ToolInvocation` dataclass**: Structured representation of a proposed tool call: `capability_id`, `parameters`, `resolved_tool` (filled by validation), `effect_class` (filled by validation).
+- **`SigilRuntime.validate_and_execute()`**: Mandatory gate method that chains seal verification → invocation validation → output validation → effect escalation. Returns validated invocations with resolved tools, escalation approvals, and output validation status.
 - **37 new tests** in `tests/test_validator.py` covering: effect class behavior, capability ID minting, parameter validation (type/range/length/pattern/enum), capability resolution, effect enforcement, output schema validation, effect escalation, seal serialization round-trips, and the full validate-and-execute pipeline.
 
 ### Changed
 
-- **`SigilSeal` dataclass** — Extended with 5 new fields: `capabilities`, `parameter_constraints`, `output_schema`, `allowed_effects`, `escalate_effects`. All fields included in `canonical_payload()` (signature-covered).
-- **`Architect.seal()`** — Accepts new parameters for constraints, output schema, and effect declarations. Mints capability IDs and re-keys constraint dicts from tool names to capability IDs.
-- **`SigilSeal.from_dict()`** — Validates all new fields on deserialization, including effect class value validation against the `EffectClass` enum.
-- **`SigilRuntime.execute()` return dict** — Now includes `capabilities`, `parameter_constraints`, `output_schema`, `allowed_effects`, and `escalate_effects` alongside existing fields.
+- **`SigilSeal` dataclass**: Extended with 5 new fields: `capabilities`, `parameter_constraints`, `output_schema`, `allowed_effects`, `escalate_effects`. All fields included in `canonical_payload()` (signature-covered).
+- **`Architect.seal()`**: Accepts new parameters for constraints, output schema, and effect declarations. Mints capability IDs and re-keys constraint dicts from tool names to capability IDs.
+- **`SigilSeal.from_dict()`**: Validates all new fields on deserialization, including effect class value validation against the `EffectClass` enum.
+- **`SigilRuntime.execute()` return dict**: Now includes `capabilities`, `parameter_constraints`, `output_schema`, `allowed_effects`, and `escalate_effects` alongside existing fields.
 
 ### Test Results
 
@@ -311,25 +394,25 @@ Full details in [RED_TEAM_REPORT.md](RED_TEAM_REPORT.md).
 
 #### Fixed (HIGH severity)
 
-- **H-01: Key Rotation Mechanism** — `Keyring.rotate_key()` generates versioned keypairs with cryptographically signed succession records. Old keys remain valid during a configurable transition window. `Sentinel.verify()` checks succession records automatically.
-- **H-02: Rate Limiting on HumanGate** — Approval attempts are now rate-limited with lockout after 5 failures (5-minute cooldown). All attempts logged to audit chain.
-- **H-03: Header Redaction** — `AuditProxy` automatically redacts `Authorization`, `X-API-Key`, `Cookie`, and other sensitive headers. Custom redaction patterns supported via regex. Body content scrubbed for embedded credentials.
-- **H-05: Encoding Detectors** — `InputNormalizer` now detects UTF-7, Punycode (`xn--` domains), and leetspeak (`1gn0r3 1nstruct10ns`) attack encodings in addition to existing Base64/ROT13/Hex/URL coverage.
-- **H-06: Nonce File Integrity** — Nonce reservations logged to audit chain. On nonce file deletion/corruption, nonces are recovered from chain entries, preventing replay attacks even after file tampering.
+- **H-01: Key Rotation Mechanism**: `Keyring.rotate_key()` generates versioned keypairs with cryptographically signed succession records. Old keys remain valid during a configurable transition window. `Sentinel.verify()` checks succession records automatically.
+- **H-02: Rate Limiting on HumanGate**: Approval attempts are now rate-limited with lockout after 5 failures (5-minute cooldown). All attempts logged to audit chain.
+- **H-03: Header Redaction**: `AuditProxy` automatically redacts `Authorization`, `X-API-Key`, `Cookie`, and other sensitive headers. Custom redaction patterns supported via regex. Body content scrubbed for embedded credentials.
+- **H-05: Encoding Detectors**: `InputNormalizer` now detects UTF-7, Punycode (`xn--` domains), and leetspeak (`1gn0r3 1nstruct10ns`) attack encodings in addition to existing Base64/ROT13/Hex/URL coverage.
+- **H-06: Nonce File Integrity**: Nonce reservations logged to audit chain. On nonce file deletion/corruption, nonces are recovered from chain entries, preventing replay attacks even after file tampering.
 
 #### Fixed (MEDIUM severity)
 
-- **M-01: Robust `_get_last_entry()`** — Fallback now reads all content and takes last non-empty line, handling single-line files and missing trailing newlines.
-- **M-02: TLS Certificate Verification** — All LLM adapters accept `verify_tls` and `ca_bundle` parameters. Disabling TLS verification logs a warning to the audit chain.
-- **M-03: Pricing Data Integrity** — `pricing.json` can be cryptographically signed via `CostCalculator.sign_pricing()`. Tampered pricing files fall back to built-in defaults.
-- **M-04: Improved Loyalty Analysis** — Negative compliance markers ("I cannot", "I refuse", etc.) now suppress false `CRITICAL_LOYALTY_FAILURE` alerts. Expanded contradiction phrase detection. Configurable phrase lists.
-- **M-06: FileLock Timeout** — File locking uses non-blocking acquisition with exponential backoff (10ms–200ms). Configurable timeout (default 10s) prevents indefinite deadlocks.
+- **M-01: Robust `_get_last_entry()`**: Fallback now reads all content and takes last non-empty line, handling single-line files and missing trailing newlines.
+- **M-02: TLS Certificate Verification**: All LLM adapters accept `verify_tls` and `ca_bundle` parameters. Disabling TLS verification logs a warning to the audit chain.
+- **M-03: Pricing Data Integrity**: `pricing.json` can be cryptographically signed via `CostCalculator.sign_pricing()`. Tampered pricing files fall back to built-in defaults.
+- **M-04: Improved Loyalty Analysis**: Negative compliance markers ("I cannot", "I refuse", etc.) now suppress false `CRITICAL_LOYALTY_FAILURE` alerts. Expanded contradiction phrase detection. Configurable phrase lists.
+- **M-06: FileLock Timeout**: File locking uses non-blocking acquisition with exponential backoff (10ms, 200ms). Configurable timeout (default 10s) prevents indefinite deadlocks.
 
 #### Fixed (LOW severity)
 
-- **L-02: Key File Permissions** — `Keyring` warns via audit chain when private key files have overly permissive Unix permissions (group/other readable).
-- **L-03: Provenance Hardening** — `CodeProvenance` uses structural salt derived from class names and verifies required classes/methods exist at runtime. Violations logged to audit chain.
-- **L-05: Streaming Chain Verification** — `verify_chain()` processes entries line-by-line instead of loading the entire file into memory, supporting chains with millions of entries.
+- **L-02: Key File Permissions**: `Keyring` warns via audit chain when private key files have overly permissive Unix permissions (group/other readable).
+- **L-03: Provenance Hardening**: `CodeProvenance` uses structural salt derived from class names and verifies required classes/methods exist at runtime. Violations logged to audit chain.
+- **L-05: Streaming Chain Verification**: `verify_chain()` processes entries line-by-line instead of loading the entire file into memory, supporting chains with millions of entries.
 
 ### Test Results
 
@@ -345,9 +428,9 @@ Addressed the 3 CRITICAL findings from the Round 3 red team assessment.
 
 #### Fixed
 
-- **C-01: Signed Audit Chain** — Every audit chain entry is now cryptographically signed with an auto-generated system key. Entries include `signature` and `signer_key_id` fields. `verify_chain()` validates signatures in strict mode.
-- **C-02: Encrypted Key Storage** — Private keys are encrypted at rest using passphrase-derived keys (Argon2id + XSalsa20-Poly1305 via PyNaCl). Unencrypted keys auto-upgraded on first load.
-- **C-03: HumanGate Integrity Binding** — Approval signatures now bind to the specific seal content hash, preventing approval reuse across different seals.
+- **C-01: Signed Audit Chain**: Every audit chain entry is now cryptographically signed with an auto-generated system key. Entries include `signature` and `signer_key_id` fields. `verify_chain()` validates signatures in strict mode.
+- **C-02: Encrypted Key Storage**: Private keys are encrypted at rest using passphrase-derived keys (Argon2id + XSalsa20-Poly1305 via PyNaCl). Unencrypted keys auto-upgraded on first load.
+- **C-03: HumanGate Integrity Binding**: Approval signatures now bind to the specific seal content hash, preventing approval reuse across different seals.
 
 ---
 
@@ -355,9 +438,9 @@ Addressed the 3 CRITICAL findings from the Round 3 red team assessment.
 
 ### Security Remediation
 
-Two structured red-team passes (53 findings total) — distinct adversarial prompt regimens against separate frontier models, self-conducted by the author — revealed code that contradicted SIGIL's own promises. Every finding was addressed immediately. Full details in [SECURITY_REMEDIATION_REPORT.md](SECURITY_REMEDIATION_REPORT.md).
+Two structured red-team passes (53 findings total; distinct adversarial prompt regimens against separate frontier models, self-conducted by the author) revealed code that contradicted SIGIL's own promises. Every finding was addressed immediately. Full details in [SECURITY_REMEDIATION_REPORT.md](SECURITY_REMEDIATION_REPORT.md).
 
-#### Fixed (Tier 1 — Code contradicted its promises)
+#### Fixed (Tier 1: Code contradicted its promises)
 - `ClaudeAdapter` and `OpenAIAdapter` now actually read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars before falling back to disk files (C-05).
 - `expires_in_days=0` now correctly creates an immediately-expiring seal instead of an immortal one; negative values raise `ValueError` (H-01).
 - `WorkflowEngine` now has `process_response()` to parse `<TRANSITION>` and `<CONTEXT_UPDATE>` tags and advance state (H-08).
@@ -365,7 +448,7 @@ Two structured red-team passes (53 findings total) — distinct adversarial prom
 - Conversation history messages are now HTML-entity escaped to prevent injection via history (M-04).
 - Tool descriptions and parameter schemas are now HTML-entity escaped before context inclusion (M-05).
 
-#### Fixed (Tier 2 — Security hazards)
+#### Fixed (Tier 2: Security hazards)
 - Gemini API key is now passed via `x-goog-api-key` header instead of URL query parameter, preventing key leakage into audit logs (C-01).
 - `FileLock` now defaults to `strict=True`: lock acquisition failures raise instead of silently continuing (C-02).
 - Key names validated against `^[a-zA-Z0-9_-]+$` to prevent path traversal in all Keyring methods (C-03).
@@ -374,7 +457,7 @@ Two structured red-team passes (53 findings total) — distinct adversarial prom
 - Environment-variable key usage now logged to audit chain for visibility (RT-01).
 - CRL reads and writes are now protected by `FileLock` (RT-07).
 
-#### Fixed (Tier 3 — Robustness)
+#### Fixed (Tier 3: Robustness)
 - Nonce entries now include timestamps and are pruned after 90 days to prevent unbounded file growth (H-02).
 - `canonical_payload()` uses `copy.deepcopy(self.metadata)` (H-05).
 - `verify_chain()` no longer mutates entries in-place during verification (H-06).
@@ -388,7 +471,7 @@ Two structured red-team passes (53 findings total) — distinct adversarial prom
 - Deprecated `asyncio.get_event_loop().run_until_complete()` replaced with `asyncio.run()` in tests (M-06).
 - `get_key_id()` handles `FileNotFoundError` with clear message; `export_public()` checks env vars first (L-05/L-06).
 
-#### Changed (Tier 4 — Documentation honesty)
+#### Changed (Tier 4: Documentation honesty)
 - README: Removed "Attack failed" / "zero tag breakout risk" language.
 - README: Added Limitations section acknowledging XML boundaries are advisory, not structural.
 - README: Updated provider table with configurable model names.
@@ -433,7 +516,7 @@ SIGIL (Sovereign Integrity & Governance Interface Layer) - Open-source cryptogra
 - **Seal Revocation** - Certificate Revocation List (CRL) for compromised seals
 - **Time-Bounded Signatures** - Auto-expiring seals with configurable TTL
 - **Replay Protection** - Nonce-based one-time seal execution
-- **Merkle-Linked Audit Chain** - Tamper-evident logging with chain verification
+- **Hash-Linked Audit Chain** - Tamper-evident logging with chain verification
 
 #### Data Governance
 - **Classification Decorators** (`@vow`) - Runtime data handling enforcement
@@ -476,7 +559,7 @@ SIGIL (Sovereign Integrity & Governance Interface Layer) - Open-source cryptogra
 4. **Create GitHub Release**:
    - Go to: Releases > New release
    - Select tag: `vX.Y.Z`
-   - Title: `SIGIL vX.Y.Z — Description`
+   - Title: `SIGIL vX.Y.Z - Description`
    - Description: Copy from CHANGELOG.md or release/RELEASE_NOTES.md
    - Click "Publish release"
 
@@ -488,7 +571,8 @@ SIGIL follows [Semantic Versioning](https://semver.org/):
 - **MINOR** (0.X.0): New features, backward compatible
 - **PATCH** (0.0.X): Bug fixes, backward compatible
 
-[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/mr-gl00m/sigil/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/mr-gl00m/sigil/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/mr-gl00m/sigil/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/mr-gl00m/sigil/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/mr-gl00m/sigil/compare/v1.6.0...v1.6.1

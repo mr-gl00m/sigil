@@ -297,3 +297,20 @@ def test_approve_lockout_expires(keypair, capsys):
 
     # Should NOT be locked out since lockout time is in the past
     assert HumanGate._check_lockout(fake_id) is False
+def test_plaintext_state_is_rejected_by_default(tmp_path):
+    path = tmp_path / "downgraded_state.json"
+    path.write_text('{"entries": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="encrypted"):
+        _read_encrypted_state(path)
+
+
+def test_plaintext_state_migration_requires_explicit_opt_in(tmp_path):
+    path = tmp_path / "legacy_state.json"
+    path.write_text('{"entries": ["legacy"]}', encoding="utf-8")
+
+    migrated = _read_encrypted_state(path, allow_plaintext_migration=True)
+
+    assert migrated == {"entries": ["legacy"]}
+    assert not path.read_bytes().startswith(b"{")
+    assert _read_encrypted_state(path) == migrated
